@@ -1,0 +1,373 @@
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+
+namespace AIIDEWPF.ViewModels;
+
+/// <summary>待办筛选模式</summary>
+public enum TodoFilter
+{
+    All,
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled
+}
+
+public class ChatViewModel : INotifyPropertyChanged
+{
+    private ObservableCollection<ChatMessageDisplay> _messages = new();
+    private ObservableCollection<TodoItem> _todos = new();
+    private ObservableCollection<FileChangeItem> _fileChanges = new();
+    private ObservableCollection<AlgorithmDisplayItem> _algorithms = new();
+    private ObservableCollection<PendingFileChange> _pendingChanges = new();
+    private ObservableCollection<TerminalOutputItem> _terminalOutputs = new();
+    private ObservableCollection<Models.FileAttachment> _attachments = new();
+    private ObservableCollection<PendingMessageItem> _pendingMessages = new();
+    private string _inputText = string.Empty;
+    private bool _isStreaming;
+    private string _selectedModel = "deepseek-v4-pro";
+    private string _aiStatus = "AI: 就绪";
+    private string _chatMode = "agent";
+    private bool _isCompareMode;
+    private string _compareModelId = "";
+    private bool _isTodoExpanded;
+    private bool _isFileChangesExpanded;
+    private bool _isAlgorithmExpanded;
+    private bool _isPlanExpanded;
+    private string _planTitle = string.Empty;
+    private string _planStatus = "none"; // none / generating / pending_approval / executing / completed
+    private string _pendingPlanMessage = string.Empty;
+    private ObservableCollection<string> _currentFiles = new();
+
+    public ObservableCollection<ChatMessageDisplay> Messages { get => _messages; set { _messages = value; OnPropertyChanged(); } }
+    public ObservableCollection<TodoItem> Todos { get => _todos; set { _todos = value; OnPropertyChanged(); OnPropertyChanged(nameof(PlanProgress)); OnPropertyChanged(nameof(PlanCompletedCount)); OnPropertyChanged(nameof(PlanTotalCount)); } }
+    public ObservableCollection<FileChangeItem> FileChanges { get => _fileChanges; set { _fileChanges = value; OnPropertyChanged(); } }
+    public ObservableCollection<AlgorithmDisplayItem> Algorithms { get => _algorithms; set { _algorithms = value; OnPropertyChanged(); } }
+    public ObservableCollection<PendingFileChange> PendingChanges { get => _pendingChanges; set { _pendingChanges = value; OnPropertyChanged(); OnPropertyChanged(nameof(HasPendingChanges)); } }
+    public ObservableCollection<TerminalOutputItem> TerminalOutputs { get => _terminalOutputs; set { _terminalOutputs = value; OnPropertyChanged(); OnPropertyChanged(nameof(HasTerminalOutputs)); } }
+    private ObservableCollection<WebSearchConsentItem> _webSearchConsents = new();
+    public ObservableCollection<WebSearchConsentItem> WebSearchConsents { get => _webSearchConsents; set { _webSearchConsents = value; OnPropertyChanged(); OnPropertyChanged(nameof(HasWebSearchConsents)); } }
+    public bool HasWebSearchConsents => _webSearchConsents.Count > 0;
+    private ObservableCollection<ExternalEditConsentItem> _externalEditConsents = new();
+    public ObservableCollection<ExternalEditConsentItem> ExternalEditConsents { get => _externalEditConsents; set { _externalEditConsents = value; OnPropertyChanged(); OnPropertyChanged(nameof(HasExternalEditConsents)); } }
+    public bool HasExternalEditConsents => _externalEditConsents.Count > 0;
+    // ===== 终端命令内联确认 =====
+    private ObservableCollection<TerminalConsentItem> _terminalConsents = new();
+    public ObservableCollection<TerminalConsentItem> TerminalConsents { get => _terminalConsents; set { _terminalConsents = value; OnPropertyChanged(); OnPropertyChanged(nameof(HasTerminalConsents)); } }
+    public bool HasTerminalConsents => _terminalConsents.Count > 0;
+    public ObservableCollection<Models.FileAttachment> Attachments { get => _attachments; set { _attachments = value; OnPropertyChanged(); OnPropertyChanged(nameof(HasAttachments)); OnPropertyChanged(nameof(AttachmentSummary)); } }
+    // ===== 等待发送队列 =====
+    public ObservableCollection<PendingMessageItem> PendingMessages { get => _pendingMessages; set { _pendingMessages = value; OnPropertyChanged(); OnPropertyChanged(nameof(HasPendingMessages)); OnPropertyChanged(nameof(PendingMessageCount)); } }
+    public bool HasPendingMessages => _pendingMessages.Count > 0;
+    public int PendingMessageCount => _pendingMessages.Count;
+    public string PendingMessageSummary => _pendingMessages.Count > 0 ? $"⏳ {_pendingMessages.Count} 条消息等待发送" : "";
+
+    public void EnqueuePendingMessage(string content)
+    {
+        _pendingMessages.Add(new PendingMessageItem { Content = content, Timestamp = DateTime.Now });
+        OnPropertyChanged(nameof(HasPendingMessages));
+        OnPropertyChanged(nameof(PendingMessageCount));
+        OnPropertyChanged(nameof(PendingMessageSummary));
+    }
+
+    public string? DequeuePendingMessage()
+    {
+        if (_pendingMessages.Count == 0) return null;
+        var item = _pendingMessages[0];
+        _pendingMessages.RemoveAt(0);
+        OnPropertyChanged(nameof(HasPendingMessages));
+        OnPropertyChanged(nameof(PendingMessageCount));
+        OnPropertyChanged(nameof(PendingMessageSummary));
+        return item.Content;
+    }
+
+    public void ClearPendingMessages()
+    {
+        _pendingMessages.Clear();
+        OnPropertyChanged(nameof(HasPendingMessages));
+        OnPropertyChanged(nameof(PendingMessageCount));
+        OnPropertyChanged(nameof(PendingMessageSummary));
+    }
+
+    public void RemovePendingMessage(string id)
+    {
+        var item = _pendingMessages.FirstOrDefault(m => m.Id == id);
+        if (item != null)
+        {
+            _pendingMessages.Remove(item);
+            OnPropertyChanged(nameof(HasPendingMessages));
+            OnPropertyChanged(nameof(PendingMessageCount));
+            OnPropertyChanged(nameof(PendingMessageSummary));
+        }
+    }
+
+    public void UpdatePendingMessage(string id, string newContent)
+    {
+        var item = _pendingMessages.FirstOrDefault(m => m.Id == id);
+        if (item != null)
+        {
+            item.Content = newContent;
+        }
+    }
+    public bool HasPendingChanges => _pendingChanges.Count > 0;
+    public bool HasTerminalOutputs => _terminalOutputs.Count > 0;
+    public bool HasAttachments => _attachments.Count > 0;
+    public string AttachmentSummary => _attachments.Count == 0 ? "" : $"📎 {_attachments.Count} 个文件";
+    private bool _isTerminalExpanded = true;
+    public bool IsTerminalExpanded { get => _isTerminalExpanded; set { _isTerminalExpanded = value; OnPropertyChanged(); } }
+    private string _terminalConfirmPreference = "AlwaysAllow";
+    public string TerminalConfirmPreference { get => _terminalConfirmPreference; set { _terminalConfirmPreference = value; OnPropertyChanged(); OnPropertyChanged(nameof(IsAskEveryTime)); } }
+    public bool IsAskEveryTime => _terminalConfirmPreference == "AskEveryTime";
+    public string InputText { get => _inputText; set { _inputText = value; OnPropertyChanged(); } }
+    public bool IsStreaming { get => _isStreaming; set { _isStreaming = value; OnPropertyChanged(); OnPropertyChanged(nameof(IsNotStreaming)); } }
+    public bool IsNotStreaming => !_isStreaming;
+    public string SelectedModel { get => _selectedModel; set { _selectedModel = value; OnPropertyChanged(); } }
+    public string AIStatus { get => _aiStatus; set { _aiStatus = value; OnPropertyChanged(); } }
+    public string ChatMode { get => _chatMode; set { _chatMode = value; OnPropertyChanged(); } }
+    public bool IsAgentMode => _chatMode == "agent";
+    public bool IsCompareMode { get => _isCompareMode; set { _isCompareMode = value; OnPropertyChanged(); OnPropertyChanged(nameof(CompareModelVisible)); } }
+    public string CompareModelId { get => _compareModelId; set { _compareModelId = value; OnPropertyChanged(); } }
+    public bool CompareModelVisible => _isCompareMode;
+    public ObservableCollection<string> CurrentFiles { get => _currentFiles; set { _currentFiles = value; OnPropertyChanged(); OnPropertyChanged(nameof(HasCurrentFiles)); } }
+    public bool HasCurrentFiles => _currentFiles.Count > 0;
+    public bool IsTodoExpanded { get => _isTodoExpanded; set { _isTodoExpanded = value; OnPropertyChanged(); } }
+    public bool IsFileChangesExpanded { get => _isFileChangesExpanded; set { _isFileChangesExpanded = value; OnPropertyChanged(); } }
+    public bool IsAlgorithmExpanded { get => _isAlgorithmExpanded; set { _isAlgorithmExpanded = value; OnPropertyChanged(); } }
+
+    // ===== 计划管理 =====
+    private string _planDetail = string.Empty;
+    private bool _planDetailExpanded;
+    private string _currentExecutingStep = string.Empty;
+    private string _planSuggestionText = string.Empty;
+    private bool _isPlanSuggestionVisible;
+    private string _planSuggestionAcceptText = "📋 生成计划";
+    private string _planSuggestionSkipText = "⏭ 跳过";
+    public bool IsPlanExpanded { get => _isPlanExpanded; set { _isPlanExpanded = value; OnPropertyChanged(); } }
+    public string PlanTitle { get => _planTitle; set { _planTitle = value; OnPropertyChanged(); } }
+    public string PlanStatus { get => _planStatus; set { _planStatus = value; OnPropertyChanged(); OnPropertyChanged(nameof(HasPlan)); OnPropertyChanged(nameof(IsPlanPending)); OnPropertyChanged(nameof(IsPlanExecuting)); } }
+    public string PendingPlanMessage { get => _pendingPlanMessage; set { _pendingPlanMessage = value; OnPropertyChanged(); } }
+    public string PlanDetail { get => _planDetail; set { _planDetail = value; OnPropertyChanged(); OnPropertyChanged(nameof(HasPlanDetail)); } }
+    public bool PlanDetailExpanded { get => _planDetailExpanded; set { _planDetailExpanded = value; OnPropertyChanged(); } }
+    public string CurrentExecutingStep { get => _currentExecutingStep; set { _currentExecutingStep = value; OnPropertyChanged(); OnPropertyChanged(nameof(HasCurrentStep)); } }
+    public bool HasPlan => _planStatus != "none";
+    public bool IsPlanPending => _planStatus == "pending_approval";
+    public bool IsPlanExecuting => _planStatus == "executing";
+    public bool HasPlanDetail => !string.IsNullOrEmpty(_planDetail);
+    public bool HasCurrentStep => !string.IsNullOrEmpty(_currentExecutingStep);
+    public int PlanCompletedCount => Todos.Count(t => t.Status == "completed");
+    public int PlanTotalCount => Todos.Count;
+    public double PlanProgress => PlanTotalCount > 0 ? (double)PlanCompletedCount / PlanTotalCount * 100 : 0;
+    public string PlanProgressText => PlanTotalCount > 0 ? $"{PlanCompletedCount}/{PlanTotalCount}" : "-";
+
+    // ===== 待办筛选 =====
+    private TodoFilter _todoFilter = TodoFilter.All;
+    public TodoFilter TodoFilterMode { get => _todoFilter; set { _todoFilter = value; OnPropertyChanged(); OnPropertyChanged(nameof(FilteredTodos)); OnPropertyChanged(nameof(TodoProgressBarWidth)); } }
+    public IEnumerable<TodoItem> FilteredTodos => _todoFilter switch
+    {
+        TodoFilter.Pending => Todos.Where(t => t.Status == "pending"),
+        TodoFilter.InProgress => Todos.Where(t => t.Status == "in_progress"),
+        TodoFilter.Completed => Todos.Where(t => t.Status == "completed"),
+        TodoFilter.Cancelled => Todos.Where(t => t.Status == "cancelled"),
+        _ => Todos
+    };
+    public double TodoProgressBarWidth => PlanTotalCount > 0 ? (double)PlanCompletedCount / PlanTotalCount * 100 : 0;
+    public bool IsFilterAll => _todoFilter == TodoFilter.All;
+    public bool IsFilterPending => _todoFilter == TodoFilter.Pending;
+    public bool IsFilterInProgress => _todoFilter == TodoFilter.InProgress;
+    public bool IsFilterCompleted => _todoFilter == TodoFilter.Completed;
+    public bool IsFilterCancelled => _todoFilter == TodoFilter.Cancelled;
+    public string ActiveFilterName => _todoFilter switch
+    {
+        TodoFilter.Pending => "待办",
+        TodoFilter.InProgress => "进行中",
+        TodoFilter.Completed => "已完成",
+        TodoFilter.Cancelled => "已取消",
+        _ => "全部"
+    };
+    public int FilteredTodoCount => FilteredTodos.Count();
+
+    public void SetTodoFilter(TodoFilter filter)
+    {
+        TodoFilterMode = filter;
+        OnPropertyChanged(nameof(IsFilterAll));
+        OnPropertyChanged(nameof(IsFilterPending));
+        OnPropertyChanged(nameof(IsFilterInProgress));
+        OnPropertyChanged(nameof(IsFilterCompleted));
+        OnPropertyChanged(nameof(IsFilterCancelled));
+        OnPropertyChanged(nameof(ActiveFilterName));
+        OnPropertyChanged(nameof(FilteredTodoCount));
+    }
+
+    public void ToggleTodoStatus(TodoItem item) => item.CycleStatus();
+
+    public void ClearCompletedTodos()
+    {
+        var completed = Todos.Where(t => t.Status == "completed" || t.Status == "cancelled").ToList();
+        foreach (var item in completed)
+            Todos.Remove(item);
+        OnPropertyChanged(nameof(PlanProgress));
+        OnPropertyChanged(nameof(PlanCompletedCount));
+        OnPropertyChanged(nameof(PlanTotalCount));
+        OnPropertyChanged(nameof(FilteredTodos));
+        OnPropertyChanged(nameof(TodoProgressBarWidth));
+        OnPropertyChanged(nameof(FilteredTodoCount));
+    }
+
+    public void AddTodo(string content, string category = "")
+    {
+        if (string.IsNullOrWhiteSpace(content)) return;
+        var todo = new TodoItem
+        {
+            Id = Guid.NewGuid().ToString("N")[..8],
+            Content = content.Trim(),
+            Status = "pending",
+            Category = category
+        };
+        Todos.Add(todo);
+        OnPropertyChanged(nameof(PlanProgress));
+        OnPropertyChanged(nameof(PlanCompletedCount));
+        OnPropertyChanged(nameof(PlanTotalCount));
+        OnPropertyChanged(nameof(FilteredTodos));
+        OnPropertyChanged(nameof(TodoProgressBarWidth));
+        OnPropertyChanged(nameof(FilteredTodoCount));
+    }
+
+    public void RemoveTodo(TodoItem item)
+    {
+        Todos.Remove(item);
+        OnPropertyChanged(nameof(PlanProgress));
+        OnPropertyChanged(nameof(PlanCompletedCount));
+        OnPropertyChanged(nameof(PlanTotalCount));
+        OnPropertyChanged(nameof(FilteredTodos));
+        OnPropertyChanged(nameof(TodoProgressBarWidth));
+        OnPropertyChanged(nameof(FilteredTodoCount));
+    }
+
+    // ===== 上下文用量可视化 =====
+    private int _contextTokenUsed;
+    private int _contextTokenMax = 200000;
+    private bool _isCompressing;
+    public int ContextTokenUsed { get => _contextTokenUsed; set { _contextTokenUsed = value; OnPropertyChanged(); OnPropertyChanged(nameof(ContextUsagePercent)); OnPropertyChanged(nameof(ContextUsageText)); OnPropertyChanged(nameof(ContextUsageColor)); OnPropertyChanged(nameof(CanCompress)); } }
+    public int ContextTokenMax { get => _contextTokenMax; set { _contextTokenMax = value; OnPropertyChanged(); OnPropertyChanged(nameof(ContextUsagePercent)); OnPropertyChanged(nameof(ContextUsageText)); } }
+    public bool IsCompressing { get => _isCompressing; set { _isCompressing = value; OnPropertyChanged(); OnPropertyChanged(nameof(CanCompress)); } }
+    public double ContextUsagePercent => ContextTokenMax > 0 ? (double)ContextTokenUsed / ContextTokenMax * 100 : 0;
+    public string ContextUsageText => ContextTokenMax > 0 ? $"{ContextTokenUsed:N0} / {ContextTokenMax:N0} tokens ({ContextUsagePercent:F0}%)" : "--";
+    public string ContextUsageColor => ContextUsagePercent switch
+    {
+        >= 80 => "#dc3545",
+        >= 60 => "#fd7e14",
+        _ => "#28a745"
+    };
+    public bool CanCompress => !_isCompressing && _isStreaming == false && ContextTokenUsed > 1000;
+
+    public event Action? CompressChatRequested;
+    public event Action? NewChatRequested;
+
+    public void RequestCompress() => CompressChatRequested?.Invoke();
+    public void RequestNewChat() => NewChatRequested?.Invoke();
+
+    public void UpdateContextUsage(int tokenUsed, int tokenMax = 200000)
+    {
+        ContextTokenMax = tokenMax;
+        ContextTokenUsed = tokenUsed;
+    }
+
+    // ===== 计划建议（内联替代 MessageBox）=====
+    public string PlanSuggestionText { get => _planSuggestionText; set { _planSuggestionText = value; OnPropertyChanged(); OnPropertyChanged(nameof(HasPlanSuggestion)); } }
+    public bool IsPlanSuggestionVisible { get => _isPlanSuggestionVisible; set { _isPlanSuggestionVisible = value; OnPropertyChanged(); } }
+    public bool HasPlanSuggestion => !string.IsNullOrEmpty(_planSuggestionText);
+    public string PlanSuggestionAcceptText { get => _planSuggestionAcceptText; set { _planSuggestionAcceptText = value; OnPropertyChanged(); } }
+    public string PlanSuggestionSkipText { get => _planSuggestionSkipText; set { _planSuggestionSkipText = value; OnPropertyChanged(); } }
+
+    public event Action<bool>? PlanSuggestionAccepted; // true=生成计划, false=跳过
+
+    public event Action<string>? SendMessageRequested;
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    protected void OnPropertyChanged([CallerMemberName] string? name = null)
+        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+
+    public ChatMessageDisplay AddMessage(string role, string content)
+    {
+        var msg = new ChatMessageDisplay { Role = role, Content = content, Timestamp = DateTime.Now };
+        Messages.Add(msg);
+        return msg;
+    }
+
+    public ChatMessageDisplay AddToolCall(string name, string status, string result = "")
+    {
+        var msg = new ChatMessageDisplay { Role = "tool", Content = name, ToolStatus = status, ToolResult = result, Timestamp = DateTime.Now };
+        Messages.Add(msg);
+        return msg;
+    }
+
+    public void ResetPlan()
+    {
+        PlanStatus = "none";
+        PlanTitle = "";
+        PendingPlanMessage = "";
+        PlanDetail = "";
+        PlanDetailExpanded = false;
+        CurrentExecutingStep = "";
+        IsPlanSuggestionVisible = false;
+        PlanSuggestionText = "";
+        PlanSuggestionAcceptText = "📋 生成计划";
+        PlanSuggestionSkipText = "⏭ 跳过";
+        Todos.Clear();
+        IsPlanExpanded = false;
+    }
+
+    public void AcceptChange(PendingFileChange change)
+    {
+        change.IsPending = false;
+        change.Confirmation?.TrySetResult(true);
+        _pendingChanges.Remove(change);
+        OnPropertyChanged(nameof(HasPendingChanges));
+    }
+
+    public void RejectChange(PendingFileChange change)
+    {
+        change.IsPending = false;
+        change.Confirmation?.TrySetResult(false);
+        _pendingChanges.Remove(change);
+        OnPropertyChanged(nameof(HasPendingChanges));
+    }
+
+    public void AcceptAllPendingChanges()
+    {
+        foreach (var c in _pendingChanges.ToList())
+            AcceptChange(c);
+    }
+
+    public void RejectAllPendingChanges()
+    {
+        foreach (var c in _pendingChanges.ToList())
+            RejectChange(c);
+    }
+
+    public void SetPlanPending(string title)
+    {
+        PlanTitle = title;
+        PlanStatus = "pending_approval";
+        IsPlanExpanded = true;
+    }
+
+    public void ApprovePlan()
+    {
+        PlanStatus = "executing";
+        IsPlanExpanded = true;
+    }
+
+    public void AcceptPlanSuggestion()
+    {
+        IsPlanSuggestionVisible = false;
+        PlanSuggestionAccepted?.Invoke(true);
+    }
+
+    public void SkipPlanSuggestion()
+    {
+        IsPlanSuggestionVisible = false;
+        PlanSuggestionAccepted?.Invoke(false);
+    }
+}

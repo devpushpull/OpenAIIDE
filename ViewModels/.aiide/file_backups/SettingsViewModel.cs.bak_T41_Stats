@@ -1,0 +1,997 @@
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+using System.Windows;
+using System.Windows.Input;
+using AIIDEWPF.Models;
+using AIIDEWPF.Services;
+using AIIDEWPF.Views;
+
+namespace AIIDEWPF.ViewModels;
+
+/// <summary>
+/// 设置窗口 ViewModel —— 左侧导航 + 右侧内容切换
+/// 对标 Qoder / 通义灵码 设置面板设计
+/// </summary>
+public class SettingsViewModel : INotifyPropertyChanged
+{
+    private readonly ConfigService _configService;
+    private readonly MemoryService _memoryService;
+    private readonly ModelManager _modelManager;
+    private readonly SlashCommandService _slashCommandService;
+    private readonly NetworkService _networkService;
+    private readonly MCPService _mcpService;
+    private readonly string? _workspacePath;
+
+    public SettingsViewModel(ConfigService configService, MemoryService memoryService,
+        ModelManager modelManager, SlashCommandService slashCommandService, NetworkService networkService,
+        MCPService mcpService, string? workspacePath = null)
+    {
+        _configService = configService;
+        _memoryService = memoryService;
+        _modelManager = modelManager;
+        _slashCommandService = slashCommandService;
+        _networkService = networkService;
+        _mcpService = mcpService;
+        _workspacePath = workspacePath;
+
+        // 初始化子 ViewModel
+        MemoryVM = new MemoryViewModel(_memoryService, _workspacePath);
+        RulesVM = new RulesViewModel();
+        CommandsVM = new CommandsViewModel(_slashCommandService);
+
+        // 加载当前配置
+        var config = _configService.GetConfig();
+        _fontSize = config.Editor.FontSize;
+        _wordWrap = config.Editor.WordWrap;
+        _showMinimap = config.Editor.ShowMinimap;
+        _tabSize = config.Editor.TabSize;
+        _theme = config.Appearance.Theme;
+        _responseLanguage = config.Appearance.ResponseLanguage;
+        _autoCheckUpdates = config.Appearance.AutoCheckUpdates;
+        _apiKey = config.AI.ApiKey;
+        _defaultModel = config.AI.Model;
+        _maxTokens = config.AI.MaxTokens;
+        _streamMode = config.AI.Stream;
+        _autoWebSearch = config.AI.AutoWebSearch;
+
+        // 终端设置
+        _terminalFontFamily = config.Terminal.FontFamily;
+        _terminalFontSize = config.Terminal.FontSize;
+        _terminalCursorStyle = config.Terminal.CursorStyle;
+        _terminalShellPath = config.Terminal.ShellPath;
+        _terminalScrollbackLines = config.Terminal.ScrollbackLines;
+        _terminalEnableColors = config.Terminal.EnableColors;
+        _terminalSyntaxHighlight = config.Terminal.EnableSyntaxHighlighting;
+
+        // 文件排除设置
+        _fileExcludePatterns = config.FileExclude?.ExcludePatterns ?? "";
+        _searchExcludePatterns = config.FileExclude?.SearchExcludePatterns ?? "";
+        _useGitIgnore = config.FileExclude?.UseGitIgnore ?? true;
+        _hideDotFiles = config.FileExclude?.HideDotFiles ?? false;
+
+        // 隐私设置
+        _enableTelemetry = config.Privacy?.EnableTelemetry ?? true;
+        _enableCrashReports = config.Privacy?.EnableCrashReports ?? true;
+        _enableUsageAnalytics = config.Privacy?.EnableUsageAnalytics ?? false;
+        _shareCodeSnippets = config.Privacy?.ShareCodeSnippets ?? false;
+        _autoClearHistoryOnExit = config.Privacy?.AutoClearHistoryOnExit ?? false;
+        _historyRetentionDays = config.Privacy?.HistoryRetentionDays ?? 30;
+
+        // 代理设置
+        _enableProxy = config.Proxy?.EnableProxy ?? false;
+        _proxyType = config.Proxy?.ProxyType ?? "HTTP";
+        _proxyHost = config.Proxy?.Host ?? "127.0.0.1";
+        _proxyPort = config.Proxy?.Port ?? 8080;
+        _proxyUseAuth = config.Proxy?.UseAuth ?? false;
+        _proxyUsername = config.Proxy?.Username ?? "";
+        _proxyPassword = config.Proxy?.Password ?? "";
+
+        Models = new ObservableCollection<ProviderDef>(
+            _modelManager.GetProviders());
+
+        // 初始化自定义模型表单命令
+        AddCustomModelCommand = new RelayCommand(_ => StartAddCustomModel());
+        EditCustomModelCommand = new RelayCommand(EditCustomModel, _ => SelectedProvider != null);
+        DeleteCustomModelCommand = new RelayCommand(DeleteCustomModel, _ => SelectedProvider != null && SelectedProvider.IsCustom);
+        SaveCustomModelCommand = new RelayCommand(_ => SaveCustomModel());
+        CancelCustomModelCommand = new RelayCommand(_ => IsEditingModel = false);
+        RefreshModelsCommand = new RelayCommand(_ => RefreshModels());
+
+        // 导航项
+        NavItems = new ObservableCollection<NavItem>
+        {
+            new("通用", "General"),
+            new("AI / 模型", "AI"),
+            new("编辑器", "Editor"),
+            new("外观", "Appearance"),
+            new("终端", "Terminal"),
+            new("文件排除", "FileExclude"),
+            new("📊 用量", "Usage"),
+            new("记忆库", "Memory"),
+            new("规则", "Rules"),
+            new("命令", "Commands"),
+            new("快捷键", "Keymap"),
+            new("隐私", "Privacy"),
+            new("网络代理", "Proxy"),
+            new("网络诊断", "Network"),
+            new("🔗 MCP服务", "MCP"),
+            new("关于", "About")
+        };
+        _activePage = "General";
+
+        // 命令
+        SwitchPageCommand = new RelayCommand(SwitchPage);
+        CloseCommand = new RelayCommand(_ => RequestClose?.Invoke());
+        SaveCommand = new RelayCommand(_ => SaveAll());
+        RunNetworkDiagCommand = new RelayCommand(async _ => await RunNetworkDiagnosticsAsync());
+
+        // 初始化 MCP 命令
+        InitMCPCommands();
+        LoadMCPServers();
+    }
+
+    // ===== 导航 =====
+
+    public ObservableCollection<NavItem> NavItems { get; }
+
+    private string _activePage = "General";
+    public string ActivePage
+    {
+        get => _activePage;
+        set { _activePage = value; OnPropertyChanged(); OnPropertyChanged(nameof(IsGeneralPage)); OnPropertyChanged(nameof(IsAIPage)); OnPropertyChanged(nameof(IsEditorPage)); OnPropertyChanged(nameof(IsAppearancePage)); OnPropertyChanged(nameof(IsTerminalPage)); OnPropertyChanged(nameof(IsFileExcludePage)); OnPropertyChanged(nameof(IsUsagePage)); OnPropertyChanged(nameof(IsMemoryPage)); OnPropertyChanged(nameof(IsRulesPage)); OnPropertyChanged(nameof(IsCommandsPage)); OnPropertyChanged(nameof(IsKeymapPage)); OnPropertyChanged(nameof(IsPrivacyPage)); OnPropertyChanged(nameof(IsProxyPage)); OnPropertyChanged(nameof(IsNetworkPage)); OnPropertyChanged(nameof(IsMCPPage)); OnPropertyChanged(nameof(IsAboutPage)); }
+    }
+
+    public bool IsGeneralPage => _activePage == "General";
+    public bool IsAIPage => _activePage == "AI";
+    public bool IsEditorPage => _activePage == "Editor";
+    public bool IsAppearancePage => _activePage == "Appearance";
+    public bool IsTerminalPage => _activePage == "Terminal";
+    public bool IsFileExcludePage => _activePage == "FileExclude";
+    public bool IsUsagePage => _activePage == "Usage";
+    public bool IsMemoryPage => _activePage == "Memory";
+    public bool IsRulesPage => _activePage == "Rules";
+    public bool IsCommandsPage => _activePage == "Commands";
+    public bool IsKeymapPage => _activePage == "Keymap";
+    public bool IsPrivacyPage => _activePage == "Privacy";
+    public bool IsProxyPage => _activePage == "Proxy";
+    public bool IsNetworkPage => _activePage == "Network";
+    public bool IsMCPPage => _activePage == "MCP";
+    public bool IsAboutPage => _activePage == "About";
+
+    public ICommand SwitchPageCommand { get; }
+    public ICommand CloseCommand { get; }
+    public ICommand SaveCommand { get; }
+
+    public event Action? RequestClose;
+
+    // ===== 网络诊断 =====
+
+    public ICommand RunNetworkDiagCommand { get; }
+
+    public ObservableCollection<NetworkDiagResult> DiagResults { get; } = new();
+
+    private bool _isDiagRunning;
+    public bool IsDiagRunning { get => _isDiagRunning; set { _isDiagRunning = value; OnPropertyChanged(); OnPropertyChanged(nameof(DiagButtonText)); } }
+
+    public string DiagButtonText => IsDiagRunning ? "⏳ 诊断中..." : "🔍 开始诊断";
+
+    private string _diagSummary = "点击「开始诊断」测试网络连通性";
+    public string DiagSummary { get => _diagSummary; set { _diagSummary = value; OnPropertyChanged(); } }
+
+    // ===== 子 ViewModel =====
+    public MemoryViewModel MemoryVM { get; }
+    public RulesViewModel RulesVM { get; }
+    public CommandsViewModel CommandsVM { get; }
+
+    // ===== 通用设置 =====
+    private string _responseLanguage = "中文";
+    public string ResponseLanguage { get => _responseLanguage; set { _responseLanguage = value; OnPropertyChanged(); } }
+
+    private bool _autoCheckUpdates = true;
+    public bool AutoCheckUpdates { get => _autoCheckUpdates; set { _autoCheckUpdates = value; OnPropertyChanged(); } }
+
+    // ===== 编辑器设置 =====
+    private double _fontSize = 14;
+    public double FontSize { get => _fontSize; set { _fontSize = value; OnPropertyChanged(); } }
+
+    private bool _wordWrap = true;
+    public bool WordWrap { get => _wordWrap; set { _wordWrap = value; OnPropertyChanged(); } }
+
+    private bool _showMinimap;
+    public bool ShowMinimap { get => _showMinimap; set { _showMinimap = value; OnPropertyChanged(); } }
+
+    // ===== AI 代码补全设置 =====
+    private bool _completionEnabled = true;
+    public bool CompletionEnabled { get => _completionEnabled; set { _completionEnabled = value; OnPropertyChanged(); } }
+
+    private int _completionDebounce = 500;
+    public int CompletionDebounce { get => _completionDebounce; set { _completionDebounce = value; OnPropertyChanged(); } }
+
+    private int _completionMaxLines = 6;
+    public int CompletionMaxLines { get => _completionMaxLines; set { _completionMaxLines = value; OnPropertyChanged(); } }
+
+    private int _tabSize = 4;
+    public int TabSize { get => _tabSize; set { _tabSize = value; OnPropertyChanged(); } }
+
+    // ===== 外观设置 =====
+    private string _theme = "Dark";
+    public string Theme { get => _theme; set { _theme = value; OnPropertyChanged(); } }
+
+    public List<string> ThemeOptions { get; } = new() { "Dark", "Light" };
+
+    // ===== 终端设置 =====
+    private string _terminalFontFamily = "Consolas";
+    public string TerminalFontFamily { get => _terminalFontFamily; set { _terminalFontFamily = value; OnPropertyChanged(); } }
+
+    private int _terminalFontSize = 13;
+    public int TerminalFontSize { get => _terminalFontSize; set { _terminalFontSize = value; OnPropertyChanged(); } }
+
+    private string _terminalCursorStyle = "Block";
+    public string TerminalCursorStyle { get => _terminalCursorStyle; set { _terminalCursorStyle = value; OnPropertyChanged(); } }
+
+    public List<string> CursorStyleOptions { get; } = new() { "Block", "Underline", "IBeam" };
+
+    private string _terminalShellPath = "powershell.exe";
+    public string TerminalShellPath { get => _terminalShellPath; set { _terminalShellPath = value; OnPropertyChanged(); } }
+
+    private int _terminalScrollbackLines = 5000;
+    public int TerminalScrollbackLines { get => _terminalScrollbackLines; set { _terminalScrollbackLines = value; OnPropertyChanged(); } }
+
+    private bool _terminalEnableColors = true;
+    public bool TerminalEnableColors { get => _terminalEnableColors; set { _terminalEnableColors = value; OnPropertyChanged(); } }
+
+    private bool _terminalSyntaxHighlight = true;
+    public bool TerminalSyntaxHighlight { get => _terminalSyntaxHighlight; set { _terminalSyntaxHighlight = value; OnPropertyChanged(); } }
+
+    // ===== 文件排除设置 =====
+    private string _fileExcludePatterns = "";
+    public string FileExcludePatterns { get => _fileExcludePatterns; set { _fileExcludePatterns = value; OnPropertyChanged(); } }
+
+    private string _searchExcludePatterns = "";
+    public string SearchExcludePatterns { get => _searchExcludePatterns; set { _searchExcludePatterns = value; OnPropertyChanged(); } }
+
+    private bool _useGitIgnore = true;
+    public bool UseGitIgnore { get => _useGitIgnore; set { _useGitIgnore = value; OnPropertyChanged(); } }
+
+    private bool _hideDotFiles = false;
+    public bool HideDotFiles { get => _hideDotFiles; set { _hideDotFiles = value; OnPropertyChanged(); } }
+
+    // ===== 隐私设置 =====
+    private bool _enableTelemetry = true;
+    public bool EnableTelemetry { get => _enableTelemetry; set { _enableTelemetry = value; OnPropertyChanged(); } }
+
+    private bool _enableCrashReports = true;
+    public bool EnableCrashReports { get => _enableCrashReports; set { _enableCrashReports = value; OnPropertyChanged(); } }
+
+    private bool _enableUsageAnalytics = false;
+    public bool EnableUsageAnalytics { get => _enableUsageAnalytics; set { _enableUsageAnalytics = value; OnPropertyChanged(); } }
+
+    private bool _shareCodeSnippets = false;
+    public bool ShareCodeSnippets { get => _shareCodeSnippets; set { _shareCodeSnippets = value; OnPropertyChanged(); } }
+
+    private bool _autoClearHistoryOnExit = false;
+    public bool AutoClearHistoryOnExit { get => _autoClearHistoryOnExit; set { _autoClearHistoryOnExit = value; OnPropertyChanged(); } }
+
+    private int _historyRetentionDays = 30;
+    public int HistoryRetentionDays { get => _historyRetentionDays; set { _historyRetentionDays = value; OnPropertyChanged(); } }
+
+    // ===== 网络代理设置 =====
+    private bool _enableProxy = false;
+    public bool EnableProxy { get => _enableProxy; set { _enableProxy = value; OnPropertyChanged(); OnPropertyChanged(nameof(IsProxyEnabled)); } }
+    public bool IsProxyEnabled => _enableProxy;
+
+    private string _proxyType = "HTTP";
+    public string ProxyType { get => _proxyType; set { _proxyType = value; OnPropertyChanged(); } }
+
+    public List<string> ProxyTypeOptions { get; } = new() { "HTTP", "SOCKS5" };
+
+    private string _proxyHost = "127.0.0.1";
+    public string ProxyHost { get => _proxyHost; set { _proxyHost = value; OnPropertyChanged(); } }
+
+    private int _proxyPort = 8080;
+    public int ProxyPort { get => _proxyPort; set { _proxyPort = value; OnPropertyChanged(); } }
+
+    private bool _proxyUseAuth = false;
+    public bool ProxyUseAuth { get => _proxyUseAuth; set { _proxyUseAuth = value; OnPropertyChanged(); OnPropertyChanged(nameof(IsProxyAuthEnabled)); } }
+    public bool IsProxyAuthEnabled => _proxyUseAuth;
+
+    private string _proxyUsername = "";
+    public string ProxyUsername { get => _proxyUsername; set { _proxyUsername = value; OnPropertyChanged(); } }
+
+    private string _proxyPassword = "";
+    public string ProxyPassword { get => _proxyPassword; set { _proxyPassword = value; OnPropertyChanged(); } }
+
+    // ===== AI / 模型设置 =====
+    private string _apiKey = string.Empty;
+    public string ApiKey { get => _apiKey; set { _apiKey = value; OnPropertyChanged(); } }
+
+    private string _defaultModel = "deepseek-v4-pro";
+    public string DefaultModel { get => _defaultModel; set { _defaultModel = value; OnPropertyChanged(); } }
+
+    private int _maxTokens;
+    public int MaxTokens { get => _maxTokens; set { _maxTokens = value; OnPropertyChanged(); } }
+
+    private bool _streamMode = true;
+    public bool StreamMode { get => _streamMode; set { _streamMode = value; OnPropertyChanged(); } }
+
+    // ===== 联网搜索设置 =====
+    private bool _autoWebSearch;
+    public bool AutoWebSearch { get => _autoWebSearch; set { _autoWebSearch = value; OnPropertyChanged(); } }
+
+    public ObservableCollection<ProviderDef> Models { get; }
+
+    // ===== 自定义模型管理 =====
+    // 模型上限显示
+    public string ModelQuotaDisplay => $"模型配额: {_modelManager.TotalModelCount} / {ModelManager.MaxTotalModels}";
+    public bool CanAddMoreModels => _modelManager.CanAddMoreModels;
+    public string QuotaWarning => _modelManager.CanAddMoreModels ? "" :
+        $"⚠️ 已达到模型数量上限 ({ModelManager.MaxTotalModels} 个)，请先删除不常用的模型。";
+
+    private ProviderDef? _selectedProvider;
+    public ProviderDef? SelectedProvider { get => _selectedProvider; set { _selectedProvider = value; OnPropertyChanged(); } }
+
+    private bool _isEditingModel;
+    public bool IsEditingModel { get => _isEditingModel; set { _isEditingModel = value; OnPropertyChanged(); OnPropertyChanged(nameof(IsNotEditingModel)); } }
+    public bool IsNotEditingModel => !_isEditingModel;
+
+    // 自定义模型表单字段
+    private string _editProviderId = string.Empty;
+    public string EditProviderId { get => _editProviderId; set { _editProviderId = value; OnPropertyChanged(); } }
+
+    private string _editProviderName = string.Empty;
+    public string EditProviderName { get => _editProviderName; set { _editProviderName = value; OnPropertyChanged(); } }
+
+    private string _editBaseUrl = string.Empty;
+    public string EditBaseUrl { get => _editBaseUrl; set { _editBaseUrl = value; OnPropertyChanged(); } }
+
+    private string _editProviderApiKey = string.Empty;
+    public string EditProviderApiKey { get => _editProviderApiKey; set { _editProviderApiKey = value; OnPropertyChanged(); } }
+
+    private string _editModelId = string.Empty;
+    public string EditModelId { get => _editModelId; set { _editModelId = value; OnPropertyChanged(); } }
+
+    private string _editModelName = string.Empty;
+    public string EditModelName { get => _editModelName; set { _editModelName = value; OnPropertyChanged(); } }
+
+    private int _editModelMaxTokens;
+    public int EditModelMaxTokens { get => _editModelMaxTokens; set { _editModelMaxTokens = value; OnPropertyChanged(); } }
+
+    private bool _editAgentMode = true;
+    public bool EditAgentMode { get => _editAgentMode; set { _editAgentMode = value; OnPropertyChanged(); } }
+
+    private bool _editQAMode = true;
+    public bool EditQAMode { get => _editQAMode; set { _editQAMode = value; OnPropertyChanged(); } }
+
+    // 命令
+    public ICommand AddCustomModelCommand { get; }
+    public ICommand EditCustomModelCommand { get; }
+    public ICommand DeleteCustomModelCommand { get; }
+    public ICommand SaveCustomModelCommand { get; }
+    public ICommand CancelCustomModelCommand { get; }
+    public ICommand RefreshModelsCommand { get; }
+
+    private void RefreshModels()
+    {
+        Models.Clear();
+        foreach (var p in _modelManager.GetProviders())
+            Models.Add(p);
+        OnPropertyChanged(nameof(ModelQuotaDisplay));
+        OnPropertyChanged(nameof(CanAddMoreModels));
+        OnPropertyChanged(nameof(QuotaWarning));
+    }
+
+    private void StartAddCustomModel()
+    {
+        if (!_modelManager.CanAddMoreModels)
+        {
+            MessageBox.Show($"已达到模型数量上限（{ModelManager.MaxTotalModels} 个），请先删除不常用的模型再添加。",
+                "模型数量超限", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        SelectedProvider = null;
+        EditProviderId = string.Empty;
+        EditProviderName = string.Empty;
+        EditBaseUrl = string.Empty;
+        EditProviderApiKey = string.Empty;
+        EditModelId = string.Empty;
+        EditModelName = string.Empty;
+        EditModelMaxTokens = 0;
+        EditAgentMode = true;
+        EditQAMode = true;
+        IsEditingModel = true;
+    }
+
+    private void EditCustomModel(object? param)
+    {
+        if (SelectedProvider == null || !SelectedProvider.IsCustom) return;
+        EditProviderId = SelectedProvider.Id;
+        EditProviderName = SelectedProvider.Name;
+        EditBaseUrl = SelectedProvider.BaseUrl;
+        EditProviderApiKey = SelectedProvider.ApiKey;
+        if (SelectedProvider.Models.Count > 0)
+        {
+            var firstModel = SelectedProvider.Models[0];
+            EditModelId = firstModel.Id;
+            EditModelName = firstModel.Name;
+            EditModelMaxTokens = firstModel.MaxTokens;
+            EditAgentMode = firstModel.AgentMode;
+            EditQAMode = firstModel.QAMode;
+        }
+        else
+        {
+            EditModelId = string.Empty;
+            EditModelName = string.Empty;
+            EditModelMaxTokens = 0;
+            EditAgentMode = true;
+            EditQAMode = true;
+        }
+        IsEditingModel = true;
+    }
+
+    private void SaveCustomModel()
+    {
+        if (string.IsNullOrWhiteSpace(EditProviderId))
+        {
+            MessageBox.Show("请输入提供商 ID", "验证", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(EditProviderName))
+        {
+            MessageBox.Show("请输入提供商名称", "验证", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(EditBaseUrl))
+        {
+            MessageBox.Show("请输入 API 基础 URL", "验证", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(EditModelId))
+        {
+            MessageBox.Show("请输入模型 ID", "验证", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(EditModelName))
+        {
+            MessageBox.Show("请输入模型名称", "验证", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        // 检查是否会超过上限（新增提供商/模型时）
+        var existing = _modelManager.GetProvider(EditProviderId);
+        if (existing == null && !_modelManager.CanAddMoreModels)
+        {
+            MessageBox.Show($"已达到模型数量上限（{ModelManager.MaxTotalModels} 个），请先删除不常用的模型。",
+                "模型数量超限", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        try
+        {
+            _modelManager.RegisterOrUpdate(EditProviderId, EditProviderName, EditBaseUrl, EditProviderApiKey,
+                EditModelId, EditModelName, EditAgentMode, EditQAMode, EditModelMaxTokens, isCustom: true);
+            RefreshModels();
+            IsEditingModel = false;
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "添加失败", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private void DeleteCustomModel(object? param)
+    {
+        if (SelectedProvider == null || !SelectedProvider.IsCustom) return;
+        var result = MessageBox.Show(
+            $"确定要删除自定义模型「{SelectedProvider.Name}」吗？\n此操作不可撤销。",
+            "确认删除", MessageBoxButton.YesNo, MessageBoxImage.Question);
+        if (result != MessageBoxResult.Yes) return;
+
+        _modelManager.RemoveProvider(SelectedProvider.Id);
+        RefreshModels();
+        SelectedProvider = null;
+    }
+
+    // ===== 快捷键一览表 (只读参考) =====
+    public static List<KeymapEntry> KeymapEntries { get; } = new()
+    {
+        new("Ctrl+N", "新建文件"),
+        new("Ctrl+O", "打开文件"),
+        new("Ctrl+S", "保存文件"),
+        new("Ctrl+Z", "撤销"),
+        new("Ctrl+Y", "重做"),
+        new("Ctrl+X", "剪切"),
+        new("Ctrl+C", "复制"),
+        new("Ctrl+V", "粘贴"),
+        new("Ctrl+`", "切换终端"),
+        new("Ctrl+L", "清空对话"),
+        new("Ctrl+F", "搜索文件"),
+        new("Ctrl+Shift+F", "全局搜索"),
+    };
+
+    // ===== 操作 =====
+
+    private void SwitchPage(object? param)
+    {
+        if (param is string page)
+            ActivePage = page;
+    }
+
+    private void SaveAll()
+    {
+        var config = _configService.GetConfig();
+        config.Editor.FontSize = FontSize;
+        config.Editor.WordWrap = WordWrap;
+        config.Editor.ShowMinimap = ShowMinimap;
+        config.Editor.TabSize = TabSize;
+        config.Appearance.Theme = Theme;
+        config.Appearance.ResponseLanguage = ResponseLanguage;
+        config.Appearance.AutoCheckUpdates = AutoCheckUpdates;
+        config.AI.ApiKey = ApiKey;
+        config.AI.Model = DefaultModel;
+        config.AI.MaxTokens = MaxTokens;
+        config.AI.Stream = StreamMode;
+        config.AI.AutoWebSearch = AutoWebSearch;
+
+        // 终端设置
+        config.Terminal.FontFamily = TerminalFontFamily;
+        config.Terminal.FontSize = TerminalFontSize;
+        config.Terminal.CursorStyle = TerminalCursorStyle;
+        config.Terminal.ShellPath = TerminalShellPath;
+        config.Terminal.ScrollbackLines = TerminalScrollbackLines;
+        config.Terminal.EnableColors = TerminalEnableColors;
+        config.Terminal.EnableSyntaxHighlighting = TerminalSyntaxHighlight;
+
+        // 文件排除设置
+        config.FileExclude.ExcludePatterns = FileExcludePatterns;
+        config.FileExclude.SearchExcludePatterns = SearchExcludePatterns;
+        config.FileExclude.UseGitIgnore = UseGitIgnore;
+        config.FileExclude.HideDotFiles = HideDotFiles;
+
+        // 隐私设置
+        config.Privacy.EnableTelemetry = EnableTelemetry;
+        config.Privacy.EnableCrashReports = EnableCrashReports;
+        config.Privacy.EnableUsageAnalytics = EnableUsageAnalytics;
+        config.Privacy.ShareCodeSnippets = ShareCodeSnippets;
+        config.Privacy.AutoClearHistoryOnExit = AutoClearHistoryOnExit;
+        config.Privacy.HistoryRetentionDays = HistoryRetentionDays;
+
+        // 代理设置
+        config.Proxy.EnableProxy = EnableProxy;
+        config.Proxy.ProxyType = ProxyType;
+        config.Proxy.Host = ProxyHost;
+        config.Proxy.Port = ProxyPort;
+        config.Proxy.UseAuth = ProxyUseAuth;
+        config.Proxy.Username = ProxyUsername;
+        config.Proxy.Password = ProxyPassword;
+
+        _configService.Save();
+
+        MessageBox.Show("设置已保存", "AI IDE", MessageBoxButton.OK, MessageBoxImage.Information);
+        RequestClose?.Invoke();
+    }
+
+    // ===== 用量看板 =====
+    public string UsageSessionInputTokens => Services.CommonUtils.FormatTokens(_modelManager.GetType().Assembly.GetType("AIIDEWPF.Services.UsageTrackerService") == null ? 0 : 0);
+
+    /// <summary>用量追踪器引用（从 MainViewModel 传入）</summary>
+    private UsageTrackerService? _usageTracker;
+    public void SetUsageTracker(UsageTrackerService? tracker)
+    {
+        if (_usageTracker != null)
+            _usageTracker.OnStatusChanged -= OnUsageChanged;
+        _usageTracker = tracker;
+        if (_usageTracker != null)
+            _usageTracker.OnStatusChanged += OnUsageChanged;
+        RefreshUsageData();
+    }
+
+    private void OnUsageChanged()
+    {
+        Application.Current?.Dispatcher.Invoke(() => RefreshUsageData());
+    }
+
+    public void RefreshUsageData()
+    {
+        if (_usageTracker == null) return;
+        OnPropertyChanged(nameof(UsageStatusText));
+        OnPropertyChanged(nameof(UsageSessionInput));
+        OnPropertyChanged(nameof(UsageSessionOutput));
+        OnPropertyChanged(nameof(UsageSessionTotal));
+        OnPropertyChanged(nameof(UsageApiRemaining));
+        OnPropertyChanged(nameof(UsageApiTotal));
+        OnPropertyChanged(nameof(UsageApiPercent));
+        OnPropertyChanged(nameof(UsageApiPercentText));
+        OnPropertyChanged(nameof(UsageWarningThreshold));
+        OnPropertyChanged(nameof(UsageCriticalThreshold));
+        OnPropertyChanged(nameof(UsageSessionWarningLimit));
+        OnPropertyChanged(nameof(UsageWarningMessage));
+        OnPropertyChanged(nameof(UsageStatusLevel));
+        OnPropertyChanged(nameof(UsageHasApiInfo));
+        OnPropertyChanged(nameof(UsageSessionPercentText));
+    }
+
+    public string UsageStatusText => _usageTracker?.StatusText ?? "（暂无数据，请先发起一次 AI 对话）";
+    public string UsageSessionInput => _usageTracker != null ? Services.CommonUtils.FormatTokens(_usageTracker.SessionInputTokens) : "—";
+    public string UsageSessionOutput => _usageTracker != null ? Services.CommonUtils.FormatTokens(_usageTracker.SessionOutputTokens) : "—";
+    public string UsageSessionTotal => _usageTracker != null ? Services.CommonUtils.FormatTokens(_usageTracker.SessionTotalTokens) : "—";
+    public string UsageApiRemaining => _usageTracker != null && _usageTracker.RateLimitRemainingTokens > 0 ? Services.CommonUtils.FormatTokens(_usageTracker.RateLimitRemainingTokens) : "—";
+    public string UsageApiTotal => _usageTracker != null && _usageTracker.RateLimitTotalTokens > 0 ? Services.CommonUtils.FormatTokens(_usageTracker.RateLimitTotalTokens) : "—";
+    public double UsageApiPercent => _usageTracker?.RateLimitUsagePercent ?? -1;
+    public string UsageApiPercentText => UsageApiPercent >= 0 ? $"{UsageApiPercent:F1}%" : "—";
+    public int UsageWarningThreshold => (int)(_usageTracker?.WarningThresholdPercent ?? 80);
+    public int UsageCriticalThreshold => (int)(_usageTracker?.CriticalThresholdPercent ?? 95);
+    public int UsageSessionWarningLimit => _usageTracker?.SessionTokenWarningLimit ?? 100_000;
+    public string UsageWarningMessage => _usageTracker?.WarningMessage ?? "";
+    public bool HasUsageWarning => !string.IsNullOrEmpty(UsageWarningMessage);
+    public string UsageStatusLevel => UsageApiPercent switch
+    {
+        >= 95 => "🚨 严重",
+        >= 80 => "⚠️ 警告",
+        >= 0 => "✅ 正常",
+        _ => "📊 未知"
+    };
+    public bool UsageHasApiInfo => _usageTracker?.HasRateLimitInfo ?? false;
+    public string UsageSessionPercentText
+    {
+        get
+        {
+            if (_usageTracker == null || _usageTracker.SessionTokenWarningLimit <= 0) return "—";
+            var pct = _usageTracker.SessionTotalTokens * 100.0 / _usageTracker.SessionTokenWarningLimit;
+            return $"{pct:F1}% (上限 {Services.CommonUtils.FormatTokens(_usageTracker.SessionTokenWarningLimit)})";
+        }
+    }
+
+    // ===== 环境信息（关于页面） =====
+    private StartupDiagResult? _startupDiag;
+    public async Task LoadEnvInfoAsync()
+    {
+        _startupDiag = await _networkService.RunStartupDiagnosticsAsync(quickMode: true);
+        OnPropertyChanged(nameof(EnvDotNetStatus));
+        OnPropertyChanged(nameof(EnvGitStatus));
+        OnPropertyChanged(nameof(EnvAllReady));
+        OnPropertyChanged(nameof(EnvSummary));
+        OnPropertyChanged(nameof(EnvNetworkStatus));
+    }
+    public string EnvDotNetStatus => _startupDiag?.Environment?.DotNet.DisplayText ?? "检测中...";
+    public string EnvGitStatus => _startupDiag?.Environment?.Git.DisplayText ?? "检测中...";
+    public string EnvNetworkStatus => _startupDiag != null
+        ? (_startupDiag.IsNetworkAvailable ? "✅ 已连接" : "❌ 未连接")
+        : "⏳ 检测中...";
+    public bool EnvAllReady => _startupDiag?.IsAllGood ?? false;
+    public string EnvSummary => _startupDiag != null
+        ? (_startupDiag.IsAllGood ? "✅ 所有环境就绪" : "⚠️ 部分环境缺失，可能影响功能")
+        : "⏳ 检测中...";
+
+    // ===== 网络诊断方法 =====
+
+    private async Task RunNetworkDiagnosticsAsync()
+    {
+        if (IsDiagRunning) return;
+        IsDiagRunning = true;
+        DiagResults.Clear();
+        DiagSummary = "正在诊断网络连接...";
+
+        try
+        {
+            var results = await _networkService.RunDiagnosticsAsync();
+            foreach (var r in results)
+                DiagResults.Add(r);
+
+            var success = results.Count(r => r.Status == DiagStatus.Success);
+            var failed = results.Count(r => r.Status == DiagStatus.Failed);
+            DiagSummary = failed == 0
+                ? $"✅ 全部通过 ({success}/{results.Count})"
+                : $"⚠️ {success} 通过, {failed} 失败 ({results.Count} 项)";
+        }
+        catch (Exception ex)
+        {
+            DiagSummary = $"❌ 诊断异常: {ex.Message}";
+        }
+        finally
+        {
+            IsDiagRunning = false;
+        }
+    }
+
+    // ===== INotifyPropertyChanged =====
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+    protected void OnPropertyChanged([CallerMemberName] string? name = null)
+        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+
+    // ===== MCP 服务管理 =====
+
+    public ObservableCollection<MCPServerDisplay> MCPServers { get; } = new();
+    public ObservableCollection<MCPMarketItem> MCPMarketItems { get; } = new();
+
+    private bool _mcpIsLoading;
+    public bool MCPIsLoading { get => _mcpIsLoading; set { _mcpIsLoading = value; OnPropertyChanged(); OnPropertyChanged(nameof(MCPNotLoading)); } }
+    public bool MCPNotLoading => !_mcpIsLoading;
+
+    private string _mcpMarketStatus = "点击刷新加载工具市场";
+    public string MCPMarketStatus { get => _mcpMarketStatus; set { _mcpMarketStatus = value; OnPropertyChanged(); } }
+
+    public ICommand RefreshMCPServersCommand { get; private set; } = null!;
+    public ICommand RefreshMCPMarketCommand { get; private set; } = null!;
+    public ICommand InstallMCPCommand { get; private set; } = null!;
+    public ICommand UninstallMCPCommand { get; private set; } = null!;
+    public ICommand AddMCPServerCommand { get; private set; } = null!;
+    public ICommand EditMCPServerCommand { get; private set; } = null!;
+
+    private void InitMCPCommands()
+    {
+        RefreshMCPServersCommand = new RelayCommand(_ => LoadMCPServers());
+        RefreshMCPMarketCommand = new RelayCommand(async _ => await LoadMCPMarketplaceAsync());
+        InstallMCPCommand = new RelayCommand(param =>
+        {
+            if (param is MCPMarketItem item)
+                InstallMCPServer(item);
+        });
+        UninstallMCPCommand = new RelayCommand(param =>
+        {
+            if (param is MCPServerDisplay display)
+                UninstallMCPServer(display);
+        });
+        AddMCPServerCommand = new RelayCommand(_ =>
+        {
+            var dlg = new MCPEditDialog();
+            if (dlg.ShowDialog() == true && dlg.Result != null)
+            {
+                _mcpService.Add(dlg.Result);
+                LoadMCPServers();
+            }
+        });
+        EditMCPServerCommand = new RelayCommand(param =>
+        {
+            if (param is MCPServerDisplay display)
+            {
+                var dlg = new MCPEditDialog(display.ToConfig());
+                if (dlg.ShowDialog() == true && dlg.Result != null)
+                {
+                    _mcpService.Update(dlg.Result);
+                    LoadMCPServers();
+                }
+            }
+        });
+    }
+
+    public void LoadMCPServers()
+    {
+        MCPServers.Clear();
+        foreach (var s in _mcpService.Servers)
+            MCPServers.Add(new MCPServerDisplay(s));
+        SyncMCPInstallStatus();
+    }
+
+    public async Task LoadMCPMarketplaceAsync()
+    {
+        MCPIsLoading = true;
+        MCPMarketStatus = "正在加载工具市场...";
+        try
+        {
+            var items = await MarketplaceService.GetMCPMarketplaceAsync();
+            MCPMarketItems.Clear();
+            foreach (var item in items)
+                MCPMarketItems.Add(item);
+            SyncMCPInstallStatus();
+            MCPMarketStatus = $"共 {MCPMarketItems.Count} 个工具";
+        }
+        catch (Exception ex)
+        {
+            MCPMarketStatus = $"加载失败: {ex.Message}";
+        }
+        finally
+        {
+            MCPIsLoading = false;
+        }
+    }
+
+    private void SyncMCPInstallStatus()
+    {
+        var installedIds = _mcpService.Servers.Select(s => s.Id).ToHashSet();
+        foreach (var item in MCPMarketItems)
+            item.IsInstalled = installedIds.Contains(item.Id);
+    }
+
+    private void InstallMCPServer(MCPMarketItem item)
+    {
+        if (item.IsInstalled)
+        {
+            MessageBox.Show($"{item.Name} 已安装。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var config = new MCPServerConfig
+        {
+            Id = item.Id,
+            Name = item.Name,
+            Command = item.Command,
+            Args = item.Args.Split(' ', StringSplitOptions.RemoveEmptyEntries),
+            Enabled = true,
+            Description = item.Description
+        };
+
+        _mcpService.Add(config);
+        item.IsInstalled = true;
+        LoadMCPServers();
+        MessageBox.Show($"✅ {item.Name} 安装成功！\n命令: {item.Command} {item.Args}",
+            "安装成功", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    private void UninstallMCPServer(MCPServerDisplay display)
+    {
+        var result = MessageBox.Show(
+            $"确认卸载 MCP 服务 \"{display.Name}\"?\n\n" +
+            "卸载操作将：\n" +
+            "1. 删除服务器配置\n" +
+            "2. 清理 npx/npm 缓存中的相关包\n\n" +
+            "是否继续？",
+            "卸载确认", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+
+        if (result != MessageBoxResult.Yes) return;
+
+        try
+        {
+            // 1. 删除服务器配置
+            _mcpService.Delete(display.Id);
+
+            // 2. 尝试清理 npm/npx 缓存（异步执行，不影响主流程）
+            _ = CleanupMCPPackageAsync(display);
+
+            LoadMCPServers();
+            MessageBox.Show($"✅ {display.Name} 已卸载。", "卸载成功", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"卸载失败: {ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private async Task CleanupMCPPackageAsync(MCPServerDisplay display)
+    {
+        try
+        {
+            // 从 Args 中提取包名（npx 参数格式: -y @scope/package-name ...）
+            string? packageName = null;
+            foreach (var arg in display.Args)
+            {
+                if (arg.StartsWith("@") || (!arg.StartsWith("-") && arg.Contains('/')))
+                {
+                    packageName = arg;
+                    break;
+                }
+                // 也匹配普通包名（非 - 开头，非路径）
+                if (!arg.StartsWith("-") && !arg.StartsWith("/") && !arg.Contains('='))
+                {
+                    packageName = arg;
+                    break;
+                }
+            }
+
+            if (packageName != null)
+            {
+                // 清理 npx 缓存
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "npm",
+                    Arguments = $"cache clean {packageName} --force",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                var proc = System.Diagnostics.Process.Start(psi);
+                if (proc != null)
+                {
+                    await proc.WaitForExitAsync();
+                    LogService.Instance.Info($"MCP包缓存已清理: {packageName}", "MCP");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogService.Instance.Warn($"MCP包缓存清理失败（可忽略）: {ex.Message}", "MCP");
+        }
+    }
+}
+
+/// <summary>导航项</summary>
+public class NavItem
+{
+    public string Label { get; set; }
+    public string PageKey { get; set; }
+    public NavItem(string label, string pageKey) { Label = label; PageKey = pageKey; }
+}
+
+/// <summary>快捷键条目</summary>
+public class KeymapEntry
+{
+    public string Shortcut { get; set; }
+    public string Action { get; set; }
+    public KeymapEntry(string shortcut, string action) { Shortcut = shortcut; Action = action; }
+}
+
+/// <summary>规则管理 ViewModel</summary>
+public class RulesViewModel : INotifyPropertyChanged
+{
+    public RulesViewModel()
+    {
+        AddCommand = new RelayCommand(_ => StartAdd());
+        DeleteCommand = new RelayCommand(Delete, _ => SelectedRule != null);
+        SaveCommand = new RelayCommand(_ => Save());
+        CancelEditCommand = new RelayCommand(_ => CancelEdit());
+    }
+
+    private ObservableCollection<RuleItem> _rules = new();
+    public ObservableCollection<RuleItem> Rules { get => _rules; set { _rules = value; OnPropertyChanged(); } }
+
+    private RuleItem? _selectedRule;
+    public RuleItem? SelectedRule { get => _selectedRule; set { _selectedRule = value; OnPropertyChanged(); OnPropertyChanged(nameof(IsEditing)); } }
+
+    private string _editName = string.Empty;
+    public string EditName { get => _editName; set { _editName = value; OnPropertyChanged(); } }
+
+    private string _editContent = string.Empty;
+    public string EditContent { get => _editContent; set { _editContent = value; OnPropertyChanged(); } }
+
+    private string _editRuleType = "always";
+    public string EditRuleType { get => _editRuleType; set { _editRuleType = value; OnPropertyChanged(); } }
+
+    private string _editGlob = string.Empty;
+    public string EditGlob { get => _editGlob; set { _editGlob = value; OnPropertyChanged(); } }
+
+    private string _editDescription = string.Empty;
+    public string EditDescription { get => _editDescription; set { _editDescription = value; OnPropertyChanged(); } }
+
+    private bool _isEditing;
+    public bool IsEditing { get => _isEditing; set { _isEditing = value; OnPropertyChanged(); OnPropertyChanged(nameof(IsNotEditing)); } }
+    public bool IsNotEditing => !_isEditing;
+
+    public static List<string> RuleTypes { get; } = new() { "always", "manual", "model_decision", "glob" };
+    public static Dictionary<string, string> RuleTypeNames { get; } = new()
+    {
+        ["always"] = "始终生效",
+        ["manual"] = "手动引入",
+        ["model_decision"] = "模型决策",
+        ["glob"] = "按文件匹配"
+    };
+
+    public ICommand AddCommand { get; }
+    public ICommand DeleteCommand { get; }
+    public ICommand SaveCommand { get; }
+    public ICommand CancelEditCommand { get; }
+
+    public void LoadRules(List<RuleItem> rules) => Rules = new ObservableCollection<RuleItem>(rules);
+    public List<RuleItem> GetRules() => Rules.ToList();
+
+    private void StartAdd()
+    {
+        SelectedRule = null;
+        EditName = string.Empty;
+        EditContent = string.Empty;
+        EditRuleType = "always";
+        EditGlob = string.Empty;
+        EditDescription = string.Empty;
+        IsEditing = true;
+    }
+
+    private void Save()
+    {
+        if (string.IsNullOrWhiteSpace(EditName) || string.IsNullOrWhiteSpace(EditContent)) return;
+        Rules.Add(new RuleItem { Name = EditName, Content = EditContent, RuleType = EditRuleType, GlobPattern = string.IsNullOrWhiteSpace(EditGlob) ? null : EditGlob, Description = string.IsNullOrWhiteSpace(EditDescription) ? null : EditDescription });
+        IsEditing = false;
+    }
+
+    private void CancelEdit() => IsEditing = false;
+
+    private void Delete(object? param)
+    {
+        if (SelectedRule != null)
+            Rules.Remove(SelectedRule);
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+    protected void OnPropertyChanged([CallerMemberName] string? name = null)
+        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+}

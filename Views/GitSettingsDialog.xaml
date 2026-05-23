@@ -1,0 +1,147 @@
+<Window x:Class="AIIDEWPF.Views.GitSettingsDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="⚙️ Git 远程仓库配置" Width="520" Height="620"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        Background="#252526" Foreground="#d4d4d4">
+    <Window.Resources>
+        <Style TargetType="TextBox">
+            <Setter Property="Background" Value="#3a3a3a"/>
+            <Setter Property="Foreground" Value="#d4d4d4"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Height" Value="32"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+        </Style>
+        <Style TargetType="PasswordBox">
+            <Setter Property="Background" Value="#3a3a3a"/>
+            <Setter Property="Foreground" Value="#d4d4d4"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Padding" Value="8,6"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Height" Value="32"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+        </Style>
+        <Style TargetType="Button">
+            <Setter Property="Height" Value="30"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Padding" Value="14,0"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+        </Style>
+    </Window.Resources>
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- 标题 -->
+        <StackPanel Grid.Row="0" Margin="0,0,0,12">
+            <TextBlock FontSize="16" FontWeight="Bold" Foreground="#e8c050">
+                <Run Text="🐙 Git "/><Run Text="远程仓库配置"/>
+            </TextBlock>
+            <TextBlock x:Name="GitStatusLabel" FontSize="11" Foreground="#888" Margin="0,4,0,0"/>
+        </StackPanel>
+
+        <!-- 快捷预设 -->
+        <Border Grid.Row="1" Background="#2a2a2a" CornerRadius="4" Padding="10,8" Margin="0,0,0,8">
+            <StackPanel>
+                <TextBlock Text="快捷预设" Foreground="#888" FontSize="11" Margin="0,0,0,6"/>
+                <WrapPanel>
+                    <Button x:Name="GitHubPresetBtn" Content="🐙 GitHub" Background="#3a3a3a" Foreground="#d4d4d4"
+                            Width="90" Height="26" FontSize="11" Margin="0,0,6,4" Click="GitHubPreset_Click"/>
+                    <Button x:Name="GitLabPresetBtn" Content="🦊 GitLab" Background="#3a3a3a" Foreground="#d4d4d4"
+                            Width="90" Height="26" FontSize="11" Margin="0,0,6,4" Click="GitLabPreset_Click"/>
+                    <Button x:Name="GiteePresetBtn" Content="🏠 Gitee" Background="#3a3a3a" Foreground="#d4d4d4"
+                            Width="90" Height="26" FontSize="11" Margin="0,0,6,4" Click="GiteePreset_Click"/>
+                    <!-- 自定义预设按钮由代码动态添加 -->
+                </WrapPanel>
+            </StackPanel>
+        </Border>
+
+        <!-- 自定义平台管理 -->
+        <Border Grid.Row="2" Background="#2a2a2a" CornerRadius="4" Padding="10,8" Margin="0,0,0,12">
+            <StackPanel>
+                <TextBlock Text="➕ 添加自定义 Git 平台" Foreground="#e8c050" FontSize="11" Margin="0,0,0,6"/>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="名称" Foreground="#aaa" FontSize="11" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                    <TextBox Grid.Column="1" x:Name="NewPlatformName" Height="28" FontSize="12"
+                             ToolTip="平台名称，如 Gogs、Gitea、Bitbucket" Margin="0,0,6,0"/>
+                    <Button Grid.Column="2" x:Name="AddPlatformBtn" Content="＋ 添加" Background="#3a5a3a" Foreground="#a0d0a0"
+                            Width="70" Height="28" FontSize="11" Click="AddPlatformBtn_Click"/>
+                </Grid>
+                <Grid Margin="0,6,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="URL" Foreground="#aaa" FontSize="11" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                    <TextBox Grid.Column="1" x:Name="NewPlatformUrl" Height="28" FontSize="12"
+                             ToolTip="URL 模板，如 https://try.gogs.io/用户名/仓库名.git"/>
+                </Grid>
+
+                <!-- 已保存的自定义平台列表 -->
+                <ItemsControl x:Name="CustomPlatformsList" Margin="0,8,0,0">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Background="#3a3a3a" CornerRadius="3" Padding="6,3" Margin="0,0,4,4" Cursor="Hand"
+                                    MouseLeftButtonDown="CustomPreset_Click" Tag="{Binding}">
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="{Binding Name}" FontSize="11" Foreground="#a0d0e0" FontWeight="Bold"/>
+                                    <TextBlock Text=" ✕" FontSize="10" Foreground="#a06060" Cursor="Hand"
+                                               MouseLeftButtonDown="CustomPreset_Delete"/>
+                                </StackPanel>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </StackPanel>
+        </Border>
+
+        <!-- 配置表单 -->
+        <ScrollViewer Grid.Row="3" VerticalScrollBarVisibility="Auto">
+            <StackPanel Margin="0,0,0,8">
+                <TextBlock Text="远程名称" Foreground="#aaa" FontSize="12" Margin="0,6,0,2"/>
+                <TextBox x:Name="RemoteNameBox" Text="origin"/>
+
+                <TextBlock Text="远程仓库 URL" Foreground="#aaa" FontSize="12" Margin="0,8,0,2"/>
+                <TextBox x:Name="RemoteUrlBox" ToolTip="例如: https://github.com/user/repo.git"/>
+
+                <TextBlock Text="用户名（可选）" Foreground="#aaa" FontSize="12" Margin="0,8,0,2"/>
+                <TextBox x:Name="UsernameBox"/>
+
+                <TextBlock Text="密码 / Token（可选）" Foreground="#aaa" FontSize="12" Margin="0,8,0,2"/>
+                <PasswordBox x:Name="PasswordBox"/>
+
+                <TextBlock Text="分支" Foreground="#aaa" FontSize="12" Margin="0,8,0,2"/>
+                <TextBox x:Name="BranchBox" Text="main"/>
+
+                <TextBlock Text="提交信息模板" Foreground="#aaa" FontSize="12" Margin="0,8,0,2"/>
+                <TextBox x:Name="CommitMsgBox" Text="update"/>
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- 按钮 -->
+        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button x:Name="InitBtn" Content="📦 初始化仓库" Background="#3a5a3a" Foreground="#a0d0a0"
+                    Width="110" Margin="0,0,8,0" Click="InitBtn_Click"/>
+            <Button x:Name="SaveBtn" Content="💾 保存配置" Background="#3a6a8a" Foreground="#a0d0e0"
+                    Width="100" Margin="0,0,8,0" Click="SaveBtn_Click"/>
+            <Button x:Name="CancelBtn" Content="取消" Background="#4a4a4a" Foreground="#aaa"
+                    Width="70" Click="CancelBtn_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

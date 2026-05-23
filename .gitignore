@@ -1,0 +1,27 @@
+# AIIDE Git Ignore
+
+# 管理员密钥文件 —— 每台机器独立生成，绝不提交到版本控制
+.adminkey
+
+# 构建输出
+bin/
+obj/
+*.user
+*.suo
+*.vs/
+build_output.txt
+
+# 日志
+logs/
+
+# 配置文件（含API Key等敏感信息）
+setting/aiide-config.json
+
+# 临时文件
+*.tmp
+*.bak
+bak*/
+
+# IDE
+.vs/
+*.DotSettings.user

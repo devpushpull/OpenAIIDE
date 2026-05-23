@@ -1,0 +1,90 @@
+<UserControl x:Class="AIIDEWPF.Views.AIDiffView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:avalonedit="http://icsharpcode.net/sharpdevelop/avalonedit">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- 工具栏 -->
+        <Border Grid.Row="0" Background="#2a2a2a" BorderBrush="#444" BorderThickness="0,0,0,1" Padding="6,4">
+            <Grid>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="Diff 对比" FontSize="12" FontWeight="Bold" Foreground="#e0e0e0" VerticalAlignment="Center" Margin="0,0,12,0"/>
+                    <TextBlock x:Name="TxtStats" FontSize="11" Foreground="#aaa" VerticalAlignment="Center"/>
+                    <StackPanel Orientation="Horizontal" Margin="12,0,0,0">
+                        <Button x:Name="BtnSideBySide" Content="双栏" Width="50" Height="22" FontSize="11"
+                                Background="#094771" Foreground="White" BorderThickness="0" Click="BtnSideBySide_Click"/>
+                        <Button x:Name="BtnUnified" Content="统一" Width="50" Height="22" FontSize="11"
+                                Background="#3a3a3a" Foreground="#aaa" BorderThickness="0" Margin="2,0,0,0" Click="BtnUnified_Click"/>
+                    </StackPanel>
+                    <StackPanel x:Name="ActionsPanel" Orientation="Horizontal" Margin="16,0,0,0"
+                                Visibility="Collapsed">
+                        <Button x:Name="BtnAccept" Content="✓ 接受全部" Width="78" Height="22" FontSize="11"
+                                Background="#1a5a1a" Foreground="#90ee90" BorderThickness="0" Click="BtnAccept_Click" ToolTip="接受当前选中的Hunk或全部"/>
+                        <Button x:Name="BtnReject" Content="✗ 拒绝全部" Width="78" Height="22" FontSize="11"
+                                Background="#5a1a1a" Foreground="#f0a0a0" BorderThickness="0" Margin="4,0,0,0" Click="BtnReject_Click" ToolTip="拒绝当前选中的Hunk或全部"/>
+                    </StackPanel>
+                </StackPanel>
+                <!-- Hunk 导航 -->
+                <StackPanel x:Name="HunkNavPanel" Orientation="Horizontal" HorizontalAlignment="Right"
+                            Visibility="Collapsed">
+                    <Button x:Name="PrevHunkBtn" Content="◀ 上一块" Width="64" Height="22" FontSize="10"
+                            Background="#3a3a3a" Foreground="#d4d4d4" BorderThickness="0" Click="PrevHunk_Click"/>
+                    <TextBlock x:Name="TxtHunkPos" Text="1/1" FontSize="11" Foreground="#aaa"
+                               VerticalAlignment="Center" Margin="6,0"/>
+                    <Button x:Name="NextHunkBtn" Content="下一块 ▶" Width="64" Height="22" FontSize="10"
+                            Background="#3a3a3a" Foreground="#d4d4d4" BorderThickness="0" Click="NextHunk_Click"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- 双栏模式 -->
+        <Grid x:Name="SideBySidePanel" Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="4"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <!-- 左侧原版 -->
+            <Grid Grid.Column="0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <Border Grid.Row="0" Background="#2a2010" Padding="6,2" BorderBrush="#3a2a10" BorderThickness="0,0,0,1">
+                    <TextBlock Text="原始版本" FontSize="11" Foreground="#f0c040"/>
+                </Border>
+                <avalonedit:TextEditor x:Name="OldEditor" Grid.Row="1"
+                    IsReadOnly="True" WordWrap="False" FontFamily="Consolas,monospace" FontSize="13"
+                    Background="#1e1e1e" Foreground="#d4d4d4" ShowLineNumbers="True"
+                    HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"/>
+            </Grid>
+            <!-- 分隔条 -->
+            <GridSplitter Grid.Column="1" Width="4" Background="#555" HorizontalAlignment="Stretch"/>
+            <!-- 右侧新版 -->
+            <Grid Grid.Column="2">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <Border Grid.Row="0" Background="#201a2a" Padding="6,2" BorderBrush="#2a1a3a" BorderThickness="0,0,0,1">
+                    <TextBlock Text="修改版本" FontSize="11" Foreground="#90b0f0"/>
+                </Border>
+                <avalonedit:TextEditor x:Name="NewEditor" Grid.Row="1"
+                    IsReadOnly="True" WordWrap="False" FontFamily="Consolas,monospace" FontSize="13"
+                    Background="#1e1e1e" Foreground="#d4d4d4" ShowLineNumbers="True"
+                    HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"/>
+            </Grid>
+        </Grid>
+
+        <!-- 统一模式 -->
+        <avalonedit:TextEditor x:Name="UnifiedEditor" Grid.Row="1"
+            Visibility="Collapsed"
+            IsReadOnly="True" WordWrap="False" FontFamily="Consolas,monospace" FontSize="13"
+            Background="#1e1e1e" Foreground="#d4d4d4" ShowLineNumbers="True"
+            HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"/>
+    </Grid>
+</UserControl>

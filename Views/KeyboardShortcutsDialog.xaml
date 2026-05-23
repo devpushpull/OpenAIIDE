@@ -1,0 +1,78 @@
+<Window x:Class="AIIDEWPF.Views.KeyboardShortcutsDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:conv="clr-namespace:AIIDEWPF.Converters"
+        Title="⌨ 快捷键参考" Width="650" Height="520"
+        WindowStartupLocation="CenterOwner" ResizeMode="CanResize"
+        Background="#252526" Foreground="#d4d4d4">
+    <Window.Resources>
+        <conv:BoolToVisibilityConverter x:Key="BoolToVis"/>
+        <Style TargetType="TextBlock" x:Key="CategoryHeader">
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Foreground" Value="#e8c050"/>
+            <Setter Property="Margin" Value="0,16,0,6"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- 标题 -->
+        <StackPanel Grid.Row="0" Margin="0,0,0,10">
+            <TextBlock FontSize="18" FontWeight="Bold" Foreground="#e0e0e0">
+                ⌨ 快捷键参考
+            </TextBlock>
+            <TextBlock FontSize="12" Foreground="#888" Margin="0,4,0,0"
+                       TextWrapping="Wrap">
+                以下为 AI IDE 全部键盘快捷键。部分快捷键可在设置中自定义。
+            </TextBlock>
+        </StackPanel>
+
+        <!-- 快捷键列表 -->
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <ItemsControl x:Name="ShortcutsList">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <StackPanel>
+                            <!-- 分类标题 -->
+                            <TextBlock Text="{Binding Category}" Style="{StaticResource CategoryHeader}"
+                                       Visibility="{Binding IsCategoryHeader, Converter={StaticResource BoolToVis}}"/>
+
+                            <!-- 快捷键行 -->
+                            <Border Background="#2a2a2a" CornerRadius="4" Padding="10,6" Margin="0,2"
+                                    Visibility="{Binding IsItem, Converter={StaticResource BoolToVis}}">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="{Binding Name}"
+                                               FontSize="12" Foreground="#d4d4d4"
+                                               VerticalAlignment="Center"/>
+                                    <Border Grid.Column="1" Background="#333" CornerRadius="3"
+                                            Padding="8,3" MinWidth="80" HorizontalAlignment="Right">
+                                        <TextBlock Text="{Binding ShortcutKey}"
+                                                   FontSize="11" FontFamily="Consolas"
+                                                   Foreground="#569cd6"
+                                                   HorizontalAlignment="Center"/>
+                                    </Border>
+                                </Grid>
+                            </Border>
+                        </StackPanel>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </ScrollViewer>
+
+        <!-- 底部提示 -->
+        <TextBlock Grid.Row="2" FontSize="11" Foreground="#555"
+                   Margin="0,12,0,0" TextWrapping="Wrap">
+            💡 提示：按 F1 或从菜单 帮助 → 快捷键参考 可随时查看此页面。
+        </TextBlock>
+    </Grid>
+</Window>

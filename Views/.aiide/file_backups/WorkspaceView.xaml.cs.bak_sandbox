@@ -1,0 +1,1785 @@
+using System.IO;
+using System.Linq;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using AIIDEWPF.ViewModels;
+using AIIDEWPF.Models;
+using AIIDEWPF.Services;
+using Microsoft.VisualBasic;
+
+namespace AIIDEWPF.Views;
+
+public partial class WorkspaceView : UserControl
+{
+    private readonly MainViewModel _viewModel;
+    private ModelManager ModelMgr => _viewModel.ModelManager;
+    private InlineCompletionLayer? _completionLayer;
+    private DiagnosticsMargin? _diagnosticsMargin;
+    private LSPService? _lspService;
+    private readonly VoiceInputService _voiceInput;
+    private GridLength _savedSidebarWidth = new(260);
+    private GridLength _savedAIPanelWidth = new(480);
+
+    public WorkspaceView(MainViewModel viewModel)
+    {
+        InitializeComponent();
+        _viewModel = viewModel;
+        DataContext = _viewModel;
+
+        // 设置 CodeEditor 引用，供调试器和LSP使用
+        _viewModel.CodeEditor = CodeEditor;
+
+        // ===== 余额提醒状态栏 =====
+        SetupBalanceBar();
+
+        // ===== LSP 实时诊断 =====
+        InitializeLSP();
+
+        // 初始化提供商下拉（预设 + 可自定义输入）
+        foreach (var p in ModelMgr.GetProviders())
+            SettingsProviderBox.Items.Add(p);
+        SettingsProviderBox.IsEditable = true;
+
+        // 聊天栏提供商下拉
+        foreach (var p in ModelMgr.GetProviders())
+            ChatProviderBox.Items.Add(p);
+        ChatProviderBox.SelectedItem = ModelMgr.ActiveProvider;
+        RefreshChatModelBox();
+
+        // ===== 语音输入初始化 =====
+        _voiceInput = new VoiceInputService();
+        _voiceInput.OnSpeechRecognized += text =>
+        {
+            // 将识别文本插入到光标位置
+            var caretIndex = ChatInputBox.CaretIndex;
+            var currentText = _viewModel.Chat.InputText ?? "";
+            var insertText = currentText.Length > 0 && caretIndex > 0 && !currentText.EndsWith(' ')
+                ? " " + text
+                : text;
+            _viewModel.Chat.InputText = currentText.Insert(caretIndex, insertText);
+            ChatInputBox.CaretIndex = caretIndex + insertText.Length;
+            ChatInputBox.Focus();
+        };
+        _voiceInput.OnListeningChanged += isListening =>
+        {
+            VoiceBtn.Background = isListening
+                ? new SolidColorBrush(Color.FromRgb(30, 150, 60))  // 录音中: 绿色
+                : new SolidColorBrush(Color.FromRgb(0x3a, 0x3a, 0x3a)); // 空闲: 灰色
+            VoiceBtn.Foreground = isListening
+                ? new SolidColorBrush(Color.FromRgb(255, 255, 255))
+                : new SolidColorBrush(Color.FromRgb(0xaa, 0xaa, 0xaa));
+            VoiceBtn.ToolTip = isListening ? "正在录音... (点击停止)" : "语音输入 (点击开始/停止)";
+        };
+        _voiceInput.OnError += msg =>
+        {
+            System.Windows.MessageBox.Show(msg, "语音输入", MessageBoxButton.OK, MessageBoxImage.Warning);
+        };
+
+        // ===== 事件绑定 =====
+
+        // 全部折叠命令：由 ViewModel 触发，View 执行
+        _viewModel.CollapseAllRequested += () => CollapseAllTreeNodes(FileTreeView);
+        // 自动定位文件：打开文件时在树中定位
+        _viewModel.FileOpenedInTree += filePath => RevealFileInTree(filePath);
+
+        // 弹窗打开/关闭
+        _viewModel.PropertyChanged += (s, e) =>
+        {
+            if (e.PropertyName == nameof(MainViewModel.IsSettingsOpen))
+            {
+                if (_viewModel.IsSettingsOpen)
+                {
+                    SettingsOverlay.Visibility = Visibility.Visible;
+                    RefreshModelList();
+                    ClearModelForm();
+                }
+                else
+                {
+                    SettingsOverlay.Visibility = Visibility.Collapsed;
+                }
+            }
+            // 面板切换时自动刷新数据
+            else if (e.PropertyName == nameof(MainViewModel.ActiveSidebar))
+            {
+                switch (_viewModel.ActiveSidebar)
+                {
+                    case "git":
+                        _viewModel.GitRefreshCommand.Execute(null);
+                        break;
+                    case "extensions":
+                        _viewModel.RefreshPluginsCommand.Execute(null);
+                        break;
+                    case "wiki":
+                        _viewModel.WikiSearchCommand.Execute(null);
+                        break;
+                    case "remote":
+                        _viewModel.RefreshRemoteCommand.Execute(null);
+                        break;
+                    case "containers":
+                        _viewModel.RefreshContainersCommand.Execute(null);
+                        break;
+                }
+            }
+            // 侧边栏显隐 → 动态调整 Grid 列宽 + Min/Max + 分隔条显隐
+            else if (e.PropertyName == nameof(MainViewModel.IsLeftSidebarVisible))
+            {
+                var colSidebar = MainLayoutGrid.ColumnDefinitions[1];
+                var colSplit = MainLayoutGrid.ColumnDefinitions[2];
+                if (_viewModel.IsLeftSidebarVisible)
+                {
+                    colSidebar.Width = _savedSidebarWidth;
+                    colSidebar.MinWidth = 180;
+                    colSidebar.MaxWidth = 500;
+                    colSplit.Width = GridLength.Auto;
+                    LeftSplitter.Visibility = Visibility.Visible;
+                }
+                else
+                {
+                    _savedSidebarWidth = colSidebar.Width;
+                    colSidebar.Width = new GridLength(0);
+                    colSidebar.MinWidth = 0;
+                    colSidebar.MaxWidth = double.PositiveInfinity;
+                    colSplit.Width = new GridLength(0);
+                    LeftSplitter.Visibility = Visibility.Collapsed;
+                }
+            }
+            // AI面板显隐 → 动态调整 Grid 列宽 + Min/Max + 分隔条显隐
+            else if (e.PropertyName == nameof(MainViewModel.IsAIPanelVisible))
+            {
+                var colAIPanel = MainLayoutGrid.ColumnDefinitions[5];
+                var colSplit = MainLayoutGrid.ColumnDefinitions[4];
+                if (_viewModel.IsAIPanelVisible)
+                {
+                    colAIPanel.Width = _savedAIPanelWidth;
+                    colAIPanel.MinWidth = 280;
+                    colAIPanel.MaxWidth = 800;
+                    colSplit.Width = GridLength.Auto;
+                    RightSplitter.Visibility = Visibility.Visible;
+                }
+                else
+                {
+                    _savedAIPanelWidth = colAIPanel.Width;
+                    colAIPanel.Width = new GridLength(0);
+                    colAIPanel.MinWidth = 0;
+                    colAIPanel.MaxWidth = double.PositiveInfinity;
+                    colSplit.Width = new GridLength(0);
+                    RightSplitter.Visibility = Visibility.Collapsed;
+                }
+            }
+        };
+
+        // 初始化分隔条可见性（与 ViewModel 当前状态同步）
+        LeftSplitter.Visibility = _viewModel.IsLeftSidebarVisible ? Visibility.Visible : Visibility.Collapsed;
+        RightSplitter.Visibility = _viewModel.IsAIPanelVisible ? Visibility.Visible : Visibility.Collapsed;
+
+        // AvalonEdit syntax highlighting
+        CodeEditor.SyntaxHighlighting = ICSharpCode.AvalonEdit.Highlighting.HighlightingManager.Instance
+            .GetDefinition("C#");
+
+        // ===== C# 语法增强着色（async/await/var/Task等关键词）=====
+        CodeEditor.TextArea.TextView.LineTransformers.Add(new CSharpEnhanceColorizer());
+
+        // ===== 颜色预览渲染器（检测 #hex, rgb(), hsl() 颜色值并显示内联颜色方块）=====
+        CodeEditor.TextArea.TextView.BackgroundRenderers.Add(new ColorPreviewRenderer(CodeEditor.TextArea));
+
+        // ===== 停止/发送按钮联动 =====
+        _viewModel.Chat.PropertyChanged += (s, e) =>
+        {
+            if (e.PropertyName == nameof(ChatViewModel.IsStreaming))
+            {
+                Dispatcher.Invoke(() =>
+                {
+                    StopBtn.Visibility = _viewModel.Chat.IsStreaming ? Visibility.Visible : Visibility.Collapsed;
+                    SendBtn.Visibility = _viewModel.Chat.IsStreaming ? Visibility.Collapsed : Visibility.Visible;
+                });
+            }
+        };
+
+        // 编辑器语言高亮切换 + 行号导航
+        _viewModel.Editor.PropertyChanged += (s, e) =>
+        {
+            if (e.PropertyName == nameof(EditorViewModel.FileType))
+                ApplySyntaxHighlighting(_viewModel.Editor.FileType);
+            if (e.PropertyName == nameof(EditorViewModel.NavigateToLine) && _viewModel.Editor.NavigateToLine >= 1)
+            {
+                var line = _viewModel.Editor.NavigateToLine;
+                Dispatcher.BeginInvoke(() =>
+                {
+                    CodeEditor.ScrollToLine(line);
+                    // 将光标移到目标行
+                    var docLine = CodeEditor.Document.GetLineByNumber(line);
+                    CodeEditor.TextArea.Caret.Offset = docLine.Offset;
+                    CodeEditor.Focus();
+                }, System.Windows.Threading.DispatcherPriority.Background);
+            }
+        };
+
+        // Editor <-> ViewModel 双向同步（AvalonEdit Text 不是 DependencyProperty，只能代码绑定）
+        _viewModel.Editor.PropertyChanged += (s, e) =>
+        {
+            if (e.PropertyName == nameof(EditorViewModel.CurrentContent))
+            {
+                if (CodeEditor.Text != _viewModel.Editor.CurrentContent)
+                    CodeEditor.Text = _viewModel.Editor.CurrentContent;
+            }
+        };
+        CodeEditor.TextChanged += (s, e) =>
+        {
+            if (_viewModel.Editor.CurrentContent != CodeEditor.Text)
+                _viewModel.Editor.CurrentContent = CodeEditor.Text;
+            // LSP: 通知文档变更
+            NotifyLSPDidChange();
+        };
+
+        // File drag & drop
+        AllowDrop = true;
+        DragEnter += (s, e) =>
+        {
+            if (e.Data.GetDataPresent(DataFormats.FileDrop))
+                e.Effects = DragDropEffects.Copy;
+            else
+                e.Effects = DragDropEffects.None;
+        };
+        Drop += (s, e) =>
+        {
+            if (e.Data.GetData(DataFormats.FileDrop) is string[] files && files.Length > 0)
+                _viewModel.OpenFile(files[0]);
+        };
+
+        // ===== AI 代码补全层 =====
+        var ccService = new CodeCompletionService();
+        ccService.Initialize(_viewModel.Config, ModelMgr);
+        _completionLayer = new InlineCompletionLayer(CodeEditor, ccService);
+
+        // ===== LSP 诊断波浪线渲染器 =====
+        _diagnosticsMargin = new DiagnosticsMargin(CodeEditor);
+        CodeEditor.TextArea.TextView.BackgroundRenderers.Add(_diagnosticsMargin);
+
+        // ===== 断点装订线 =====
+        var bpMargin = new BreakpointMargin(CodeEditor, _viewModel.DebugSvc);
+        CodeEditor.TextArea.TextView.BackgroundRenderers.Add(bpMargin);
+
+        // 断点变更时刷新装订线
+        _viewModel.DebugSvc.OnBreakpointsChanged += () =>
+            Dispatcher.Invoke(() => CodeEditor.TextArea.TextView.InvalidateLayer(ICSharpCode.AvalonEdit.Rendering.KnownLayer.Background));
+
+        // 快捷键：Alt+P 手动触发补全
+        KeyDown += (s, e) =>
+        {
+            if (e.Key == Key.P && Keyboard.Modifiers == ModifierKeys.Alt)
+            {
+                e.Handled = true;
+                _completionLayer?.RequestCompletion();
+            }
+        };
+
+        // ===== Ctrl+Click 跳转到定义 =====
+        CodeEditor.MouseLeftButtonDown += (s, e) =>
+        {
+            if (Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                e.Handled = true;
+                var pos = CodeEditor.GetPositionFromPoint(e.GetPosition(CodeEditor));
+                if (pos.HasValue)
+                {
+                    var offset = CodeEditor.Document.GetOffset(pos.Value.Location);
+                    var word = GetWordAtOffset(CodeEditor.Document, offset);
+                    if (!string.IsNullOrEmpty(word))
+                        _viewModel.GoToDefinitionCommand.Execute(null);
+                }
+            }
+        };
+
+        // 粘贴检测——检测粘贴的代码是否在项目中
+        DataObject.AddPastingHandler(ChatInputBox, (s, e) =>
+        {
+            if (e.DataObject.GetDataPresent(DataFormats.Text))
+            {
+                var text = e.DataObject.GetData(DataFormats.Text) as string;
+                if (!string.IsNullOrEmpty(text))
+                {
+                    Dispatcher.BeginInvoke(() => _viewModel.DetectPastedCode(text),
+                        System.Windows.Threading.DispatcherPriority.Background);
+                }
+            }
+        });
+
+        // ═══ 输入框 Watermark 提示：有内容或聚焦时隐藏 ═══
+        UpdateWatermarkVisibility();
+
+        // Keyboard shortcuts
+        KeyDown += (s, e) =>
+        {
+            if (Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                switch (e.Key)
+                {
+                    case Key.S: _viewModel.SaveFile(false); e.Handled = true; break;
+                    case Key.O: _viewModel.OpenFile(); e.Handled = true; break;
+                    case Key.N: _viewModel.NewFile(); e.Handled = true; break;
+                    case Key.W: _viewModel.CloseFile(); e.Handled = true; break;
+                    case Key.Oem3: _viewModel.ToggleTerminal(); e.Handled = true; break;
+                    case Key.K: HandleInlineEdit(); e.Handled = true; break;
+                    case Key.B: _viewModel.ToggleSidebarCommand.Execute(null); e.Handled = true; break;
+                    case Key.L: _viewModel.ToggleAIPanelCommand.Execute(null); e.Handled = true; break;
+                    case Key.F: OpenSearchInEditor(); e.Handled = true; break;
+                    case Key.H: OpenReplaceInEditor(); e.Handled = true; break;
+                    case Key.P: _viewModel.SwitchSidebarCommand.Execute("search"); e.Handled = true; break;
+                }
+            }
+            else if (Keyboard.Modifiers == (ModifierKeys.Control | ModifierKeys.Shift))
+            {
+                switch (e.Key)
+                {
+                    case Key.F: _viewModel.SwitchSidebarCommand.Execute("search"); e.Handled = true; break;
+                    case Key.P: _viewModel.OpenPreviewCommand.Execute(null); e.Handled = true; break;
+                }
+            }
+            // F1 快捷键帮助
+            else if (e.Key == Key.F1 && Keyboard.Modifiers == ModifierKeys.None)
+            {
+                ShowKeyboardShortcuts();
+                e.Handled = true;
+            }
+            // 调试快捷键（无修饰键或 Shift）
+            else if (e.Key == Key.F9)
+            {
+                _viewModel.ToggleBreakpointCommand.Execute(null);
+                e.Handled = true;
+            }
+            else if (e.Key == Key.F12 && Keyboard.Modifiers == ModifierKeys.None)
+            {
+                _viewModel.GoToDefinitionCommand.Execute(null);
+                e.Handled = true;
+            }
+            else if (e.Key == Key.F12 && Keyboard.Modifiers == ModifierKeys.Shift)
+            {
+                _viewModel.FindReferencesCommand.Execute(null);
+                e.Handled = true;
+            }
+            else if (e.Key == Key.F5 && Keyboard.Modifiers == ModifierKeys.None)
+            {
+                _viewModel.IsDebugging = !_viewModel.IsDebugging;
+                if (_viewModel.IsDebugging) _viewModel.StartDebugCommand.Execute(null);
+                else _viewModel.StopDebugCommand.Execute(null);
+                e.Handled = true;
+            }
+            else if (e.Key == Key.F5 && Keyboard.Modifiers == ModifierKeys.Shift)
+            {
+                _viewModel.StopDebugCommand.Execute(null);
+                e.Handled = true;
+            }
+            else if (e.Key == Key.F10 && Keyboard.Modifiers == ModifierKeys.None)
+            {
+                _viewModel.StepOverCommand.Execute(null);
+                e.Handled = true;
+            }
+            else if (e.Key == Key.F11 && Keyboard.Modifiers == ModifierKeys.None)
+            {
+                _viewModel.StepIntoCommand.Execute(null);
+                e.Handled = true;
+            }
+            else if (e.Key == Key.F11 && Keyboard.Modifiers == ModifierKeys.Shift)
+            {
+                _viewModel.StepOutCommand.Execute(null);
+                e.Handled = true;
+            }
+        };
+
+        // Auto-scroll chat: 仅当新消息到达时自动滚到底部
+        _viewModel.Chat.Messages.CollectionChanged += (s, e) =>
+        {
+            if (e.Action == System.Collections.Specialized.NotifyCollectionChangedAction.Add)
+            {
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    // 强制更新布局，确保 ScrollableHeight / VerticalOffset 为当前值
+                    ChatScrollViewer.UpdateLayout();
+                    double scrollableHeight = ChatScrollViewer.ScrollableHeight;
+                    double verticalOffset = ChatScrollViewer.VerticalOffset;
+                    bool isNearBottom = verticalOffset >= scrollableHeight - 50;
+                    if (isNearBottom || scrollableHeight <= 0)
+                        ChatScrollViewer.ScrollToEnd();
+                }), System.Windows.Threading.DispatcherPriority.Background);
+            }
+        };
+    }
+
+    // ===== 弹窗：模型管理 =====
+
+    private void RefreshModelList()
+    {
+        ModelListBox.Items.Clear();
+        foreach (var provider in ModelMgr.GetProviders())
+        {
+            foreach (var model in provider.Models)
+            {
+                ModelListBox.Items.Add($"{provider.Name} / {model.Name}");
+            }
+        }
+    }
+
+    private void ClearModelForm()
+    {
+        SettingsProviderBox.SelectedIndex = -1;
+        SettingsProviderBox.Text = "";
+        SettingsBaseUrlBox.Text = "";
+        SettingsModelIdBox.Text = "";
+        SettingsModelNameBox.Text = "";
+        SettingsApiKeyBox.Password = "";
+        SettingsAgentCheck.IsChecked = true;
+        SettingsQACheck.IsChecked = true;
+        SettingsMaxTokensBox.Text = "";
+        SettingsMaxTokensLabel.Text = "最大令牌数（留空使用模型默认值）";
+    }
+
+    private void ModelList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (ModelListBox.SelectedIndex < 0) return;
+
+        var providers = ModelMgr.GetProviders().ToList();
+        int idx = 0;
+        ProviderDef? foundProv = null;
+        ModelDef? foundModel = null;
+        foreach (var p in providers)
+        {
+            for (int mi = 0; mi < p.Models.Count; mi++)
+            {
+                if (idx == ModelListBox.SelectedIndex)
+                {
+                    foundProv = p;
+                    foundModel = p.Models[mi];
+                    break;
+                }
+                idx++;
+            }
+            if (foundProv != null) break;
+        }
+
+        if (foundProv == null || foundModel == null) return;
+
+        SettingsProviderBox.SelectedItem = foundProv;
+        SettingsBaseUrlBox.Text = foundProv.BaseUrl;
+        SettingsModelIdBox.Text = foundModel.Id;
+        SettingsModelNameBox.Text = foundModel.Name;
+        SettingsApiKeyBox.Password = foundProv.ApiKey;
+        SettingsAgentCheck.IsChecked = foundModel.AgentMode;
+        SettingsQACheck.IsChecked = foundModel.QAMode;
+
+        var cfg = _viewModel.GetConfig().AI;
+        SettingsMaxTokensBox.Text = cfg.MaxTokens > 0 ? cfg.MaxTokens.ToString() : ModelMgr.GetDefaultMaxTokens(foundModel.Id);
+    }
+
+    private void AddModel_Click(object sender, RoutedEventArgs e)
+    {
+        var provName = SettingsProviderBox.Text.Trim();
+        var provId = (SettingsProviderBox.SelectedItem as ProviderDef)?.Id ?? provName.ToLowerInvariant();
+        var baseUrl = SettingsBaseUrlBox.Text.Trim();
+        var modelId = SettingsModelIdBox.Text.Trim();
+        var modelName = SettingsModelNameBox.Text.Trim();
+        var apiKey = SettingsApiKeyBox.Password;
+        var agent = SettingsAgentCheck.IsChecked == true;
+        var qa = SettingsQACheck.IsChecked == true;
+        int.TryParse(SettingsMaxTokensBox.Text.Trim(), out var maxTokens);
+
+        if (string.IsNullOrEmpty(modelId))
+        {
+            MessageBox.Show("模型 ID 不能为空", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var provider = ModelMgr.RegisterOrUpdate(provId, provName, baseUrl, apiKey, modelId, modelName, agent, qa);
+
+        if (maxTokens > 0)
+            _viewModel.GetConfig().AI.MaxTokens = maxTokens;
+        _viewModel.SaveSettings();
+
+        ModelMgr.SetActive(provId, modelId);
+        RefreshModelList();
+        RefreshChatProviderBox();
+        RefreshChatModelBox();
+        _viewModel.RefreshAvailableModes();
+
+        ChatModelBox.SelectedItem = ModelMgr.ActiveModel;
+        _viewModel.Chat.SelectedModel = modelId;
+        _viewModel.Chat.AIStatus = string.IsNullOrEmpty(apiKey) ? "AI: 未配置" : "AI: 就绪";
+    }
+
+    private void DeleteModel_Click(object sender, RoutedEventArgs e)
+    {
+        if (ModelListBox.SelectedIndex < 0) return;
+
+        var providers = ModelMgr.GetProviders().ToList();
+        int idx = 0;
+        ProviderDef? foundProv = null;
+        ModelDef? foundModel = null;
+        foreach (var p in providers)
+        {
+            for (int mi = 0; mi < p.Models.Count; mi++)
+            {
+                if (idx == ModelListBox.SelectedIndex)
+                {
+                    foundProv = p;
+                    foundModel = p.Models[mi];
+                    break;
+                }
+                idx++;
+            }
+            if (foundProv != null) break;
+        }
+
+        if (foundProv == null || foundModel == null) return;
+
+        var result = MessageBox.Show($"确定删除模型 \"{foundProv.Name} / {foundModel.Name}\"？",
+            "确认删除", MessageBoxButton.YesNo, MessageBoxImage.Question);
+        if (result != MessageBoxResult.Yes) return;
+
+        ModelMgr.RemoveModel(foundProv.Id, foundModel.Id);
+        RefreshModelList();
+        ClearModelForm();
+
+        if (ModelMgr.ActiveModel == null || ModelMgr.ActiveModel.Id == foundModel.Id)
+        {
+            var firstProv = ModelMgr.GetProviders().FirstOrDefault();
+            if (firstProv != null && firstProv.Models.Count > 0)
+            {
+                ModelMgr.SetActive(firstProv.Id, firstProv.Models[0].Id);
+            }
+        }
+        RefreshChatProviderBox();
+        RefreshChatModelBox();
+        _viewModel.RefreshAvailableModes();
+        _viewModel.SaveSettings();
+    }
+
+    // ===== 聊天栏模型选择 =====
+
+    private void ChatProviderBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (ChatProviderBox.SelectedItem is ProviderDef prov)
+        {
+            ModelMgr.SetActive(prov.Id, ModelMgr.ActiveModel?.Id ?? prov.Models[0].Id);
+            RefreshChatModelBox();
+            _viewModel.RefreshAvailableModes();
+            CheckAndWarnModelConfig();
+        }
+    }
+
+    private void ChatModelBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (ChatModelBox.SelectedItem is ModelDef model)
+        {
+            ModelMgr.SetActive(
+                ModelMgr.ActiveProvider?.Id ?? "deepseek", model.Id);
+            _viewModel.Chat.SelectedModel = model.Id;
+            _viewModel.RefreshAvailableModes();
+            CheckAndWarnModelConfig();
+        }
+    }
+
+    /// <summary>模式切换（智能体/问答）时的 API Key 配置检查</summary>
+    private void ChatModeBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (ChatModeBox.SelectedValue is string modeId)
+        {
+            _viewModel.Chat.ChatMode = modeId;
+            _viewModel.RefreshAvailableModes();
+            CheckAndWarnModelConfig();
+        }
+    }
+
+    /// <summary>检查当前模型是否已配置 API Key，未配置则提示用户</summary>
+    private void CheckAndWarnModelConfig()
+    {
+        var providerId = ModelMgr.ActiveProvider?.Id ?? "";
+        var apiKey = ModelMgr.GetEffectiveApiKey(providerId);
+        if (string.IsNullOrEmpty(apiKey))
+        {
+            var modelName = ModelMgr.ActiveModel?.Name ?? ModelMgr.ActiveModel?.Id ?? "当前模型";
+            var providerName = ModelMgr.ActiveProvider?.Name ?? "当前提供商";
+
+            // 检查是否最近已显示过同类 API Key 警告，避免重复刷屏
+            var lastSysMsg = _viewModel.Chat.Messages.LastOrDefault(m => m.Role == "system");
+            bool alreadyWarned = lastSysMsg != null && lastSysMsg.Content.Contains("尚未配置");
+
+            // 两层检查：先判断是否完全未配置任何 API Key
+            if (!ModelMgr.HasAnyApiKeyConfigured())
+            {
+                _viewModel.Chat.AIStatus = "⚠️ 未配置 API Key";
+                if (!alreadyWarned)
+                    _viewModel.Chat.AddMessage("system",
+                        "⚠️ **尚未配置任何大模型 API Key**，无法使用。\n\n" +
+                        "💡 请前往 **设置 → 管理模型** 配置 API Key 后再使用该模型。");
+            }
+            else
+            {
+                _viewModel.Chat.AIStatus = $"⚠️ {providerName}/{modelName}: 未配置 API Key";
+                if (!alreadyWarned)
+                    _viewModel.Chat.AddMessage("system",
+                        $"⚠️ **{providerName} / {modelName}** 尚未配置 API Key，无法使用。\n\n" +
+                        "💡 请前往 **设置 → 管理模型** 配置 API Key 后再使用该模型。");
+            }
+        }
+        else
+        {
+            _viewModel.Chat.AIStatus = "AI: 就绪";
+        }
+    }
+
+    private void RefreshChatModelBox()
+    {
+        ChatModelBox.Items.Clear();
+        var prov = ModelMgr.ActiveProvider;
+        if (prov == null) return;
+        foreach (var m in prov.Models)
+        {
+            ChatModelBox.Items.Add(m);
+        }
+        ChatModelBox.SelectedItem = ModelMgr.ActiveModel;
+    }
+
+    private void RefreshChatProviderBox()
+    {
+        ChatProviderBox.Items.Clear();
+        foreach (var p in ModelMgr.GetProviders())
+            ChatProviderBox.Items.Add(p);
+        ChatProviderBox.SelectedItem = ModelMgr.ActiveProvider;
+    }
+
+    // ===== 终端 / 日志 =====
+
+    private void TerminalInput_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter)
+        {
+            _viewModel.TerminalInput_KeyDown(TerminalInputBox.Text);
+            TerminalInputBox.Text = string.Empty;
+            e.Handled = true;
+        }
+    }
+
+    private void ClearLog_Click(object sender, RoutedEventArgs e)
+    {
+        _viewModel.Log.Clear();
+    }
+
+    private void SettingsOverlay_MouseDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.OriginalSource == SettingsOverlay)
+            _viewModel.IsSettingsOpen = false;
+    }
+
+    private void SettingsOverlay_BlockMouseDown(object sender, MouseButtonEventArgs e)
+    {
+        e.Handled = true;
+    }
+
+    // ===== 推理消息折叠/展开 =====
+
+    private void ReasoningMessage_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.DataContext is ChatMessageDisplay msg && msg.IsReasoning)
+        {
+            msg.ToggleReasoning();
+        }
+    }
+
+    // ===== 搜索结果点击打开文件 =====
+
+    private void SearchResult_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.DataContext is GrepMatchDisplay match)
+        {
+            _viewModel.OpenFile(match.FullPath);
+        }
+    }
+
+    // ===== 文件树双击打开文件 =====
+
+    private void FileTree_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        // 从事件源查找 TreeViewItem
+        var source = e.OriginalSource as DependencyObject;
+        while (source != null && source is not TreeViewItem)
+            source = System.Windows.Media.VisualTreeHelper.GetParent(source);
+
+        if (source is TreeViewItem { DataContext: FileItem item } && !item.IsDirectory)
+        {
+            _viewModel.OpenFile(item.FullPath);
+            e.Handled = true;
+        }
+    }
+
+    // ===== 文件树单击展开文件夹 / 打开文件 =====
+    private void FileTree_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        // 只处理对 TreeViewItem 的单击（非展开箭头区域）
+        var source = e.OriginalSource as DependencyObject;
+        TreeViewItem? clickedTvi = null;
+        while (source != null)
+        {
+            if (source is TreeViewItem tvi)
+            {
+                clickedTvi = tvi;
+                break;
+            }
+            source = VisualTreeHelper.GetParent(source);
+        }
+
+        if (clickedTvi?.DataContext is not FileItem item) return;
+
+        if (item.IsDirectory)
+        {
+            // 单击文件夹：切换展开/折叠
+            clickedTvi.IsExpanded = !clickedTvi.IsExpanded;
+            e.Handled = true;
+        }
+        else
+        {
+            // 单击文件：在编辑器中打开（新标签页）
+            _viewModel.OpenFile(item.FullPath);
+            e.Handled = true;
+        }
+    }
+
+    // ===== 文件标签页点击切换 =====
+
+    private void EditorTab_Click(object sender, MouseButtonEventArgs e)
+    {
+        // 如果点击的是关闭按钮，不切换标签页
+        if (e.OriginalSource is Button)
+            return;
+        if (sender is FrameworkElement fe && fe.DataContext is EditorTab tab)
+        {
+            // 更新 IsActive 标记
+            foreach (var t in _viewModel.Editor.Tabs)
+                t.IsActive = false;
+            tab.IsActive = true;
+            _viewModel.OpenFile(tab.FilePath);
+        }
+    }
+
+    private void EditorTabClose_Click(object sender, RoutedEventArgs e)
+    {
+        // 使用 Button.Click，直接获取 DataContext
+        if (sender is Button btn && btn.DataContext is EditorTab tab)
+        {
+            var tabs = _viewModel.Editor.Tabs;
+            var idx = tabs.IndexOf(tab);
+            tabs.Remove(tab);
+
+            // 如果关闭的是当前激活标签，自动切换到相邻标签
+            if (_viewModel.Editor.CurrentFile == tab.FilePath)
+            {
+                if (tabs.Count > 0)
+                {
+                    var nextIdx = Math.Min(idx, tabs.Count - 1);
+                    var nextTab = tabs[nextIdx];
+                    nextTab.IsActive = true;
+                    _viewModel.OpenFile(nextTab.FilePath);
+                }
+                else
+                {
+                    // 所有标签已关闭，清除编辑器状态
+                    _viewModel.CloseFile();
+                }
+            }
+            e.Handled = true;
+        }
+    }
+
+    private void TabScrollLeft_Click(object sender, RoutedEventArgs e)
+    {
+        var offset = TabScrollViewer.HorizontalOffset;
+        TabScrollViewer.ScrollToHorizontalOffset(Math.Max(0, offset - 200));
+    }
+
+    private void TabScrollRight_Click(object sender, RoutedEventArgs e)
+    {
+        var offset = TabScrollViewer.HorizontalOffset;
+        var maxOffset = TabScrollViewer.ScrollableWidth;
+        TabScrollViewer.ScrollToHorizontalOffset(Math.Min(maxOffset, offset + 200));
+    }
+
+    // ===== 聊天区文件引用点击 =====
+
+    private void FileRef_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is string filePath)
+        {
+            _viewModel.OpenFile(filePath);
+        }
+    }
+
+    // ===== 文件变更接受/拒绝按钮 =====
+
+    private void AcceptChange_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is PendingFileChange change)
+        {
+            _viewModel.Chat.AcceptChange(change);
+        }
+    }
+
+    private void RejectChange_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is PendingFileChange change)
+        {
+            _viewModel.Chat.RejectChange(change);
+        }
+    }
+
+    // ===== 允许修改项目外文件 确认/拒绝 =====
+
+    private void AcceptExternalEdit_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is ExternalEditConsentItem item)
+        {
+            item.Accept();
+            _viewModel.Chat.ExternalEditConsents.Remove(item);
+        }
+    }
+
+    private void RejectExternalEdit_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is ExternalEditConsentItem item)
+        {
+            item.Reject();
+            _viewModel.Chat.ExternalEditConsents.Remove(item);
+        }
+    }
+
+    /// <summary>清空等待发送队列</summary>
+    private void ClearPendingQueue_Click(object sender, RoutedEventArgs e)
+    {
+        _viewModel.Chat.ClearPendingMessages();
+    }
+
+    /// <summary>删除等待队列中的单条消息</summary>
+    private void PendingMessageDelete_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is string id)
+        {
+            _viewModel.Chat.RemovePendingMessage(id);
+        }
+    }
+
+    /// <summary>编辑等待队列中的消息（切换编辑模式）</summary>
+    private void PendingMessageEdit_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is PendingMessageItem item)
+        {
+            if (item.IsEditing)
+            {
+                // 确认编辑：关闭编辑模式，内容已通过绑定更新
+                item.IsEditing = false;
+            }
+            else
+            {
+                // 进入编辑模式
+                item.IsEditing = true;
+            }
+        }
+    }
+
+    /// <summary>等待队列编辑框按键处理（Enter 确认编辑，Escape 取消）</summary>
+    private void PendingMessageEditBox_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == System.Windows.Input.Key.Enter && Keyboard.Modifiers == ModifierKeys.None)
+        {
+            // Enter 确认编辑
+            if (sender is FrameworkElement fe && fe.Tag is PendingMessageItem item)
+            {
+                item.IsEditing = false;
+            }
+            e.Handled = true;
+        }
+        else if (e.Key == System.Windows.Input.Key.Escape)
+        {
+            // Escape 取消编辑
+            if (sender is FrameworkElement fe && fe.Tag is PendingMessageItem item)
+            {
+                item.IsEditing = false;
+            }
+            e.Handled = true;
+        }
+    }
+
+    // ===== 手动添加待办 =====
+
+    /// <summary>点击添加待办按钮</summary>
+    private void AddTodo_Click(object sender, RoutedEventArgs e)
+    {
+        var content = NewTodoInput.Text.Trim();
+        if (string.IsNullOrEmpty(content)) return;
+        _viewModel.AddTodoCommand.Execute(content);
+        NewTodoInput.Text = string.Empty;
+    }
+
+    /// <summary>在待办输入框中按 Enter 添加</summary>
+    private void NewTodoInput_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == System.Windows.Input.Key.Enter)
+        {
+            AddTodo_Click(sender, e);
+            e.Handled = true;
+        }
+    }
+
+    /// <summary>点击变更文件旁的"恢复"按钮，恢复到 checkpoint 快照</summary>
+    private void FileChangeRestore_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is FileChangeItem item && !string.IsNullOrEmpty(item.CheckpointId))
+        {
+            var result = MessageBox.Show(
+                $"确认将「{item.FileName}」恢复到修改前状态？\n\n此操作不可撤销，当前修改将被丢弃。",
+                "恢复文件确认",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+
+            if (result == MessageBoxResult.Yes)
+            {
+                try
+                {
+                    if (_viewModel.TryRestoreFromCheckpoint(item.CheckpointId))
+                    {
+                        _viewModel.Chat.FileChanges.Remove(item);
+                        _viewModel.Chat.AddMessage("system", $"↩ 已恢复「{item.FileName}」到 checkpoint 快照状态。");
+                    }
+                    else
+                    {
+                        _viewModel.Chat.AddMessage("system", $"⚠️ 恢复「{item.FileName}」失败，请手动检查文件状态。");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _viewModel.Chat.AddMessage("system", $"❌ 恢复「{item.FileName}」时出错: {ex.Message}");
+                }
+            }
+        }
+    }
+
+    // ===== 终端命令确认按钮 =====
+
+    private void AcceptTerminalCommand_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is TerminalOutputItem item && item.IsPending)
+        {
+            var rememberChoice = _viewModel.Chat.TerminalConfirmPreference != "AskEveryTime";
+            item.Accept(rememberChoice, true);
+        }
+    }
+
+    private void RejectTerminalCommand_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is TerminalOutputItem item && item.IsPending)
+        {
+            var rememberChoice = _viewModel.Chat.TerminalConfirmPreference != "AskEveryTime";
+            item.Reject(rememberChoice, false);
+        }
+    }
+
+    private void ToggleDiff_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is PendingFileChange change)
+        {
+            change.IsDiffExpanded = !change.IsDiffExpanded;
+            if (change.IsDiffExpanded && change.DiffLines.Count == 0)
+            {
+                var original = change.OriginalContent;
+                var current = "";
+                try { if (File.Exists(change.FilePath)) current = File.ReadAllText(change.FilePath); } catch { }
+                var diff = Services.DiffService.ComputeDiff(original, current);
+                foreach (var hunk in diff.Hunks)
+                    foreach (var line in hunk.Lines)
+                        change.DiffLines.Add(new ViewModels.DiffLineDisplay
+                        {
+                            Text = line.Text,
+                            Prefix = line.Type switch { Services.DiffLineType.Added => "+", Services.DiffLineType.Removed => "-", _ => " " },
+                            BackgroundColor = line.Type switch { Services.DiffLineType.Added => "#1a3a1a", Services.DiffLineType.Removed => "#3a1a1a", _ => "Transparent" }
+                        });
+            }
+        }
+    }
+
+    private void DiffLinesControl_Loaded(object sender, RoutedEventArgs e) { }
+
+    // ===== 根据语言类型切换高亮 =====
+
+    private void ApplySyntaxHighlighting(string fileType)
+    {
+        var hlName = fileType switch
+        {
+            "C#" or "CSharp" => "C#",
+            "Python" => "Python",
+            "Java" => "Java",
+            "JavaScript" or "TypeScript" => "JavaScript",
+            "HTML" => "HTML",
+            "CSS" => "CSS",
+            "XML" or "XAML" => "XML",
+            "C" or "C++" => "C++",
+            "Rust" => "Rust",
+            "Go" => "Go",
+            "SQL" => "SQL",
+            "JSON" => "JSON",
+            "Markdown" => "Markdown",
+            "YAML" => "YAML",
+            "PowerShell" => "PowerShell",
+            "批处理" => "Batch",
+            _ => null
+        };
+
+        if (hlName != null)
+        {
+            var hl = ICSharpCode.AvalonEdit.Highlighting.HighlightingManager.Instance.GetDefinition(hlName);
+            if (hl != null)
+                CodeEditor.SyntaxHighlighting = hl;
+        }
+        else
+        {
+            CodeEditor.SyntaxHighlighting = null;
+        }
+    }
+
+    // ===== @ 提及和代码引用事件处理 =====
+
+    private void AtMentionItem_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement el && el.DataContext is AtMentionItem item)
+        {
+            _viewModel.SelectAtMentionCommand.Execute(item);
+        }
+    }
+
+    private void SlashCommandItem_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement el && el.DataContext is SlashCommandItem item)
+        {
+            _viewModel.SelectSlashCommand.Execute(item);
+        }
+    }
+
+    private void CodeRefChip_Click(object sender, MouseButtonEventArgs e)
+    {
+        // 确保不是点在了关闭按钮上
+        if (e.OriginalSource is FrameworkElement src && src.Tag as string == "dismiss")
+            return;
+
+        if (sender is FrameworkElement el && el.DataContext is CodeMatchResult result)
+        {
+            _viewModel.NavigateToCodeCommand.Execute(result);
+        }
+    }
+
+    private void CodeRefDismiss_Click(object sender, MouseButtonEventArgs e)
+    {
+        // 通过 Parent 链向上查找 DataContext
+        DependencyObject? dep = e.OriginalSource as DependencyObject;
+        while (dep != null)
+        {
+            if (dep is FrameworkElement fe && fe.DataContext is CodeMatchResult result)
+            {
+                _viewModel.DismissCodeChipCommand.Execute(result);
+                break;
+            }
+            dep = VisualTreeHelper.GetParent(dep);
+        }
+        e.Handled = true;
+    }
+
+    // ===== 调试器 =====
+
+    private void ClearBreakpoints_Click(object sender, RoutedEventArgs e)
+    {
+        _viewModel.DebugSvc.ClearAllBreakpoints();
+    }
+
+    // ===== LSP 实时诊断 =====
+
+    private async void InitializeLSP()
+    {
+        _lspService = new LSPService();
+        _lspService.OnDiagnosticsChanged += (filePath, diags) =>
+        {
+            Dispatcher.Invoke(() =>
+            {
+                _diagnosticsMargin?.SetDiagnostics(
+                    new Dictionary<string, List<Services.DiagnosticItem>>(
+                        _lspService.AllDiagnostics));
+                // 只刷新当前文件的诊断显示
+                if (filePath == _viewModel.Editor.CurrentFile)
+                    CodeEditor.TextArea.TextView.InvalidateLayer(
+                        ICSharpCode.AvalonEdit.Rendering.KnownLayer.Selection);
+            });
+        };
+
+        _lspService.OnGoToLocation += (filePath, line, column) =>
+        {
+            Dispatcher.Invoke(() =>
+            {
+                _viewModel.OpenFile(filePath);
+                _viewModel.Editor.NavigateToLine = line;
+            });
+        };
+
+        // 延迟启动LSP，等待项目路径设置
+        _viewModel.FileTree.PropertyChanged += async (s, e) =>
+        {
+            if (e.PropertyName == nameof(FileTreeViewModel.ProjectPath) &&
+                !string.IsNullOrEmpty(_viewModel.FileTree.ProjectPath))
+            {
+                await _lspService.StartAsync(_viewModel.FileTree.ProjectPath);
+                // 如果已有打开文件，通知 LSP
+                if (!string.IsNullOrEmpty(_viewModel.Editor.CurrentFile))
+                    NotifyLSPDidOpen();
+            }
+        };
+    }
+
+    private void NotifyLSPDidOpen()
+    {
+        if (_lspService == null || !_lspService.IsRunning) return;
+        var filePath = _viewModel.Editor.CurrentFile;
+        if (string.IsNullOrEmpty(filePath)) return;
+        var lang = _viewModel.Editor.FileType ?? "plaintext";
+        _lspService.DidOpen(filePath, CodeEditor.Text, lang);
+    }
+
+    private void NotifyLSPDidChange()
+    {
+        if (_lspService == null || !_lspService.IsRunning) return;
+        var filePath = _viewModel.Editor.CurrentFile;
+        if (string.IsNullOrEmpty(filePath)) return;
+        _lspService.DidChange(filePath, CodeEditor.Text);
+    }
+
+    // ===== 内联编辑 Ctrl+K =====
+
+    private async void HandleInlineEdit()
+    {
+        var selectedText = CodeEditor.SelectedText;
+        if (string.IsNullOrWhiteSpace(selectedText))
+        {
+            // 如果没有选中，选中当前行
+            var line = CodeEditor.TextArea.Caret.Line;
+            var doc = CodeEditor.Document;
+            var seg = doc.GetLineByNumber(line);
+            CodeEditor.Select(seg.Offset, seg.Length);
+            selectedText = doc.GetText(seg);
+        }
+
+        if (string.IsNullOrWhiteSpace(selectedText)) return;
+
+        var filePath = _viewModel.Editor.CurrentFile ?? "untitled";
+        var language = GuessLanguage(filePath);
+        var apiKey = ModelMgr.GetEffectiveApiKey(ModelMgr.ActiveProvider?.Id ?? "");
+        if (string.IsNullOrEmpty(apiKey)) return;
+
+        var provider = ModelMgr.ActiveProvider;
+        var baseUrl = provider?.BaseUrl ?? "https://api.deepseek.com/v1";
+        var model = ModelMgr.ActiveModel?.Id ?? "deepseek-v4-pro";
+
+        var popup = new InlineEditPopup(selectedText, filePath, language, apiKey, baseUrl, model)
+        {
+            Owner = Window.GetWindow(this)
+        };
+
+        if (popup.ShowDialog() == true && !string.IsNullOrEmpty(popup.ResultCode))
+        {
+            // 替换选中文本
+            var start = CodeEditor.SelectionStart;
+            var length = CodeEditor.SelectionLength;
+            CodeEditor.Document.Replace(start, length, popup.ResultCode);
+            CodeEditor.Select(start, popup.ResultCode.Length);
+        }
+    }
+
+    private static string GuessLanguage(string filePath)
+    {
+        var ext = System.IO.Path.GetExtension(filePath).ToLowerInvariant();
+        return ext switch
+        {
+            ".cs" => "C#",
+            ".js" => "JavaScript",
+            ".ts" or ".tsx" => "TypeScript",
+            ".py" => "Python",
+            ".java" => "Java",
+            ".go" => "Go",
+            ".rs" => "Rust",
+            ".cpp" or ".cc" or ".cxx" or ".h" or ".hpp" => "C++",
+            ".c" => "C",
+            ".html" or ".htm" => "HTML",
+            ".css" => "CSS",
+            ".json" => "JSON",
+            ".xml" => "XML",
+            ".yaml" or ".yml" => "YAML",
+            ".sql" => "SQL",
+            _ => "plaintext"
+        };
+    }
+
+    // ===== 会话标签栏事件处理 =====
+
+    private void SessionTab_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is string sessionId)
+        {
+            if (_viewModel.SwitchSessionCommand.CanExecute(sessionId))
+                _viewModel.SwitchSessionCommand.Execute(sessionId);
+        }
+    }
+
+    private void SessionClose_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is string sessionId)
+        {
+            // 防止事件冒泡触发 SessionTab_Click
+            e.Handled = true;
+            if (_viewModel.CloseSessionCommand.CanExecute(sessionId))
+                _viewModel.CloseSessionCommand.Execute(sessionId);
+        }
+    }
+
+    // ===== 未登录时发送对话框中的登录入口 =====
+    private void LoginPrompt_Click(object sender, RoutedEventArgs e)
+    {
+        _viewModel.LoginCommand.Execute(null);
+    }
+
+    /// <summary>在外部浏览器中打开预览URL</summary>
+    private void OpenPreviewInBrowser_Click(object sender, RoutedEventArgs e)
+    {
+        var url = _viewModel.PreviewUrl?.Trim();
+        if (string.IsNullOrEmpty(url)) return;
+        if (!url.StartsWith("http://") && !url.StartsWith("https://"))
+            url = "http://" + url;
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = url,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            System.Windows.MessageBox.Show($"无法打开浏览器: {ex.Message}", "预览",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    /// <summary>获取光标位置的单词（用于 Ctrl+Click 跳转）</summary>
+    private static string? GetWordAtOffset(ICSharpCode.AvalonEdit.Document.TextDocument doc, int offset)
+    {
+        if (offset < 0 || offset >= doc.TextLength) return null;
+        var text = doc.Text;
+        int start = offset, end = offset;
+        while (start > 0 && (char.IsLetterOrDigit(text[start - 1]) || text[start - 1] == '_'))
+            start--;
+        while (end < text.Length && (char.IsLetterOrDigit(text[end]) || text[end] == '_'))
+            end++;
+        var word = text[start..end];
+        return word.Length > 0 && word.Length < 80 ? word : null;
+    }
+
+    // ===== 登录 =====
+
+    private void LoginBtn_Click(object sender, RoutedEventArgs e)
+    {
+        _viewModel.LoginCommand.Execute(null);
+    }
+
+    // ===== 语音输入 =====
+
+    private void VoiceBtn_Click(object sender, RoutedEventArgs e)
+    {
+        _voiceInput.ToggleListening();
+    }
+
+    /// <summary>清理资源（由父窗口在 Closing 时调用）</summary>
+    public void Cleanup()
+    {
+        _voiceInput.Dispose();
+        if (_diagnosticsMargin != null)
+            CodeEditor.TextArea.TextView.BackgroundRenderers.Remove(_diagnosticsMargin);
+        _completionLayer = null;
+        _diagnosticsMargin = null;
+        _lspService?.Dispose();
+    }
+
+    // ===== 面板事件处理 =====
+
+    /// <summary>Git 面板：点击变更文件打开</summary>
+    private void GitChangeItem_Click(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.DataContext is Models.GitChangeDisplayItem item)
+        {
+            var fullPath = System.IO.Path.Combine(
+                _viewModel.FileTree.ProjectPath ?? "", item.FilePath);
+            if (System.IO.File.Exists(fullPath))
+            {
+                _viewModel.OpenFile(fullPath);
+            }
+        }
+    }
+
+    /// <summary>远程资源管理器：点击连接项</summary>
+    private void RemoteConnection_Click(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.DataContext is Models.RemoteConnectionItem item)
+        {
+            var msg = $"连接信息：\n类型: {item.Type}\n名称: {item.DisplayName}\n连接串: {item.ConnectionString}";
+            System.Windows.MessageBox.Show(msg, "远程连接详情",
+                System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Information);
+        }
+    }
+
+    /// <summary>Containers：启动容器</summary>
+    private void ContainerStart_Click(object sender, System.Windows.RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is string containerId)
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("docker", $"start {containerId}")
+                {
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using var p = System.Diagnostics.Process.Start(psi);
+                p?.WaitForExit(5000);
+                _viewModel.RefreshContainersCommand.Execute(null);
+                _viewModel.Chat.AddMessage("system", $"✅ 容器 {containerId} 已启动");
+            }
+            catch (Exception ex)
+            {
+                _viewModel.Chat.AddMessage("system", $"❌ 启动容器失败: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>Containers：停止容器</summary>
+    private void ContainerStop_Click(object sender, System.Windows.RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.Tag is string containerId)
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("docker", $"stop {containerId}")
+                {
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using var p = System.Diagnostics.Process.Start(psi);
+                p?.WaitForExit(5000);
+                _viewModel.RefreshContainersCommand.Execute(null);
+                _viewModel.Chat.AddMessage("system", $"⏹ 容器 {containerId} 已停止");
+            }
+            catch (Exception ex)
+            {
+                _viewModel.Chat.AddMessage("system", $"❌ 停止容器失败: {ex.Message}");
+            }
+        }
+    }
+
+    // ===== 余额提醒 =====
+
+    private UsageTrackerService? _chatUsageTracker;
+
+    private void SetupBalanceBar()
+    {
+        _chatUsageTracker = _viewModel.UsageTracker;
+        if (_chatUsageTracker != null)
+        {
+            _chatUsageTracker.OnStatusChanged += OnChatUsageStatusChanged;
+            _chatUsageTracker.OnBalanceUpdated += OnChatUsageBalanceUpdated;
+            _chatUsageTracker.OnWarning += OnChatUsageWarning;
+            _chatUsageTracker.OnCritical += OnChatUsageCritical;
+            _chatUsageTracker.OnQuotaExhausted += OnChatUsageQuotaExhausted;
+            Dispatcher.InvokeAsync(UpdateChatBalanceStatus);
+        }
+    }
+
+    private void OnChatUsageStatusChanged() => Dispatcher.InvokeAsync(UpdateChatBalanceStatus);
+    private void OnChatUsageBalanceUpdated() => Dispatcher.InvokeAsync(UpdateChatBalanceStatus);
+
+    private void OnChatUsageWarning(string msg)
+    {
+        Dispatcher.InvokeAsync(() =>
+        {
+            ChatBalanceWarningText.Text = msg;
+            ChatBalanceWarningText.Foreground = new SolidColorBrush(Color.FromRgb(0xfd, 0x7e, 0x14));
+        });
+    }
+
+    private void OnChatUsageCritical(string msg)
+    {
+        Dispatcher.InvokeAsync(() =>
+        {
+            ChatBalanceWarningText.Text = msg;
+            ChatBalanceWarningText.Foreground = new SolidColorBrush(Color.FromRgb(0xf4, 0x47, 0x47));
+        });
+    }
+
+    private void OnChatUsageQuotaExhausted(string msg)
+    {
+        Dispatcher.InvokeAsync(() =>
+        {
+            ChatBalanceBar.Visibility = Visibility.Visible;
+            ChatBalanceWarningText.Text = "❌ 余额已耗尽，无法继续处理";
+            ChatBalanceWarningText.Foreground = new SolidColorBrush(Color.FromRgb(0xf4, 0x47, 0x47));
+
+            MessageBox.Show(
+                $"{msg}\n\n" +
+                "💡 建议操作：\n" +
+                "  1. 前往大模型开放平台充值余额\n" +
+                "  2. 切换到其他可用模型（设置 → 模型管理）\n" +
+                "  3. 更换 API Key\n" +
+                "  4. 等待配额周期重置（每小时/每天自动重置）",
+                "⚠ 余额已耗尽",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+        });
+    }
+
+    private void UpdateChatBalanceStatus()
+    {
+        if (_chatUsageTracker == null)
+        {
+            ChatBalanceBar.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        ChatBalanceBar.Visibility = Visibility.Visible;
+
+        // 模型名称
+        var modelName = ModelMgr.ActiveModel?.Name ?? ModelMgr.ActiveModel?.Id ?? "当前模型";
+        ChatBalanceModelName.Text = modelName;
+
+        // 会话费用
+        var cost = _chatUsageTracker.EstimatedCostYuan;
+        ChatBalanceSessionCost.Text = $"会话: ¥{cost:F2}";
+
+        // 用量百分比
+        var usagePercent = _chatUsageTracker.RateLimitUsagePercent;
+        if (usagePercent >= 0)
+        {
+            ChatBalanceProgressBar.Width = Math.Min(60, usagePercent * 0.6);
+            ChatBalancePercentText.Text = $"{usagePercent:F0}%";
+
+            if (usagePercent >= _chatUsageTracker.CriticalThresholdPercent)
+            {
+                ChatBalanceProgressBar.Background = new SolidColorBrush(Color.FromRgb(0xf4, 0x47, 0x47));
+                ChatBalancePercentText.Foreground = new SolidColorBrush(Color.FromRgb(0xf4, 0x47, 0x47));
+            }
+            else if (usagePercent >= _chatUsageTracker.WarningThresholdPercent)
+            {
+                ChatBalanceProgressBar.Background = new SolidColorBrush(Color.FromRgb(0xfd, 0x7e, 0x14));
+                ChatBalancePercentText.Foreground = new SolidColorBrush(Color.FromRgb(0xfd, 0x7e, 0x14));
+            }
+            else
+            {
+                ChatBalanceProgressBar.Background = new SolidColorBrush(Color.FromRgb(0x4e, 0xc9, 0xb0));
+                ChatBalancePercentText.Foreground = new SolidColorBrush(Color.FromRgb(0x88, 0x88, 0x88));
+            }
+        }
+        else
+        {
+            ChatBalanceProgressBar.Width = 0;
+            ChatBalancePercentText.Text = "";
+        }
+    }
+
+    // ===== 编辑器内快捷键辅助方法 =====
+
+    /// <summary>在编辑器中打开查找</summary>
+    private void OpenSearchInEditor()
+    {
+        // AvalonEdit 自带 SearchPanel，通过 Ctrl+F 触发原生查找
+        var searchPanel = ICSharpCode.AvalonEdit.Search.SearchPanel.Install(CodeEditor.TextArea);
+        searchPanel.Open();
+    }
+
+    /// <summary>在编辑器中打开替换（打开搜索面板，用户可点击展开替换）</summary>
+    private void OpenReplaceInEditor()
+    {
+        var searchPanel = ICSharpCode.AvalonEdit.Search.SearchPanel.Install(CodeEditor.TextArea);
+        searchPanel.Open();
+        // 通过反射设置替换模式可见（AvalonEdit 内部字段）
+        try
+        {
+            var isReplaceProp = typeof(ICSharpCode.AvalonEdit.Search.SearchPanel)
+                .GetProperty("IsReplaceMode", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            if (isReplaceProp != null && isReplaceProp.CanWrite)
+            {
+                isReplaceProp.SetValue(searchPanel, true);
+            }
+        }
+        catch { /* 反射失败则仅打开搜索 */ }
+    }
+
+    /// <summary>显示快捷键参考对话框</summary>
+    private void ShowKeyboardShortcuts()
+    {
+        var dlg = new KeyboardShortcutsDialog
+        {
+            Owner = Window.GetWindow(this)
+        };
+        dlg.ShowDialog();
+    }
+
+    // ============================================================
+    // 文件树右键菜单 & 增强功能
+    // ============================================================
+
+    private FileItem? _lastSelectedFileItem;
+
+    private void FileTree_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
+    {
+        if (e.NewValue is FileItem item)
+            _lastSelectedFileItem = item;
+    }
+
+    private FileItem? GetContextFileItem()
+    {
+        return FileTreeView.SelectedItem as FileItem ?? _lastSelectedFileItem;
+    }
+
+    private string GetContextDir()
+    {
+        var item = GetContextFileItem();
+        if (item == null) return _viewModel.FileTree.ProjectPath ?? Environment.CurrentDirectory;
+        return item.IsDirectory ? item.FullPath : Path.GetDirectoryName(item.FullPath) ?? item.FullPath;
+    }
+
+    private void ContextNewFile_Click(object sender, RoutedEventArgs e)
+    {
+        var dir = GetContextDir();
+        var baseName = "新建文件.txt";
+        var filePath = Path.Combine(dir, baseName);
+        if (File.Exists(filePath) || Directory.Exists(filePath))
+            filePath = _viewModel.ResolveNameConflict(dir, baseName, false);
+        if (string.IsNullOrEmpty(filePath)) return;
+        try
+        {
+            File.WriteAllText(filePath, "");
+            _viewModel.RefreshFileTree(_viewModel.FileTree.ProjectPath);
+            _viewModel.OpenFile(filePath);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"创建文件失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private void ContextNewFolder_Click(object sender, RoutedEventArgs e)
+    {
+        var dir = GetContextDir();
+        var baseName = "新建文件夹";
+        var folderPath = Path.Combine(dir, baseName);
+        if (Directory.Exists(folderPath) || File.Exists(folderPath))
+            folderPath = _viewModel.ResolveNameConflict(dir, baseName, true);
+        if (string.IsNullOrEmpty(folderPath)) return;
+        try
+        {
+            Directory.CreateDirectory(folderPath);
+            _viewModel.RefreshFileTree(_viewModel.FileTree.ProjectPath);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"创建文件夹失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private void ContextRevealInExplorer_Click(object sender, RoutedEventArgs e)
+    {
+        var item = GetContextFileItem();
+        if (item == null) return;
+        try
+        {
+            System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{item.FullPath}\"");
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"打开资源管理器失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private void ContextOpenToSide_Click(object sender, RoutedEventArgs e)
+    {
+        var item = GetContextFileItem();
+        if (item == null || item.IsDirectory) return;
+        _viewModel.OpenFile(item.FullPath);
+    }
+
+    private void ContextCopyPath_Click(object sender, RoutedEventArgs e)
+    {
+        var item = GetContextFileItem();
+        if (item == null) return;
+        Clipboard.SetText(item.FullPath);
+    }
+
+    private void ContextCopyRelativePath_Click(object sender, RoutedEventArgs e)
+    {
+        var item = GetContextFileItem();
+        if (item == null) return;
+        Clipboard.SetText(string.IsNullOrEmpty(item.RelativePath) ? item.FullPath : item.RelativePath);
+    }
+
+    private void ContextRename_Click(object sender, RoutedEventArgs e)
+    {
+        var item = GetContextFileItem();
+        if (item == null) return;
+        var oldName = item.Name;
+        var newName = Interaction.InputBox("输入新名称：", "重命名", oldName);
+        if (string.IsNullOrEmpty(newName) || newName == oldName) return;
+
+        var dir = Path.GetDirectoryName(item.FullPath) ?? "";
+        var newPath = Path.Combine(dir, newName);
+        if (File.Exists(newPath) || Directory.Exists(newPath))
+        {
+            MessageBox.Show($"名称 \"{newName}\" 已存在，请使用其他名称。", "重命名", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        try
+        {
+            if (item.IsDirectory)
+                Directory.Move(item.FullPath, newPath);
+            else
+                File.Move(item.FullPath, newPath);
+            _viewModel.RefreshFileTree(_viewModel.FileTree.ProjectPath);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"重命名失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private void ContextDelete_Click(object sender, RoutedEventArgs e)
+    {
+        var item = GetContextFileItem();
+        if (item == null) return;
+        var msg = item.IsDirectory
+            ? $"确定要删除文件夹 \"{item.Name}\" 及其所有内容吗？此操作不可撤销。"
+            : $"确定要删除文件 \"{item.Name}\" 吗？此操作不可撤销。";
+        var result = MessageBox.Show(msg, "删除确认", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        if (result != MessageBoxResult.Yes) return;
+        try
+        {
+            if (item.IsDirectory)
+                Directory.Delete(item.FullPath, true);
+            else
+                File.Delete(item.FullPath);
+            _viewModel.RefreshFileTree(_viewModel.FileTree.ProjectPath);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"删除失败：{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    /// <summary>全部折叠文件树</summary>
+    private void CollapseAllTreeNodes(ItemsControl parent)
+    {
+        foreach (var item in parent.Items)
+        {
+            if (parent.ItemContainerGenerator.ContainerFromItem(item) is TreeViewItem tvi)
+            {
+                tvi.IsExpanded = false;
+                CollapseAllTreeNodes(tvi);
+            }
+        }
+    }
+
+    /// <summary>在文件树中定位并展开到指定文件（Auto Reveal）</summary>
+    public void RevealFileInTree(string filePath)
+    {
+        if (string.IsNullOrEmpty(filePath)) return;
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            FindAndSelectTreeItem(FileTreeView, filePath);
+        }), System.Windows.Threading.DispatcherPriority.Background);
+    }
+
+    private static bool FindAndSelectTreeItem(ItemsControl parent, string filePath)
+    {
+        foreach (var item in parent.Items)
+        {
+            if (item is FileItem fi && string.Equals(fi.FullPath, filePath, StringComparison.OrdinalIgnoreCase))
+            {
+                if (parent.ItemContainerGenerator.ContainerFromItem(item) is TreeViewItem tvi)
+                {
+                    tvi.IsSelected = true;
+                    tvi.BringIntoView();
+                    ExpandAncestors(tvi);
+                    return true;
+                }
+            }
+            if (parent.ItemContainerGenerator.ContainerFromItem(item) is TreeViewItem childTvi)
+            {
+                if (FindAndSelectTreeItem(childTvi, filePath))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private static void ExpandAncestors(TreeViewItem tvi)
+    {
+        var parent = VisualTreeHelper.GetParent(tvi);
+        while (parent != null)
+        {
+            if (parent is TreeViewItem parentTvi)
+            {
+                parentTvi.IsExpanded = true;
+                parent = VisualTreeHelper.GetParent(parentTvi);
+            }
+            else
+            {
+                parent = VisualTreeHelper.GetParent(parent);
+            }
+        }
+    }
+
+    // ===== 打开编辑器列表事件 =====
+    private void OpenEditorItem_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.DataContext is EditorTab tab)
+        {
+            _viewModel.OpenFile(tab.FilePath);
+        }
+    }
+
+    private void OpenEditorClose_Click(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is FrameworkElement fe && fe.DataContext is EditorTab tab)
+        {
+            _viewModel.Editor.Tabs.Remove(tab);
+            e.Handled = true;
+        }
+    }
+
+    // ===== 输入框 Watermark 提示显隐控制 =====
+
+    private void ChatInputBox_GotFocus(object sender, RoutedEventArgs e)
+        => UpdateWatermarkVisibility();
+
+    private void ChatInputBox_LostFocus(object sender, RoutedEventArgs e)
+        => UpdateWatermarkVisibility();
+
+    private void ChatInputBox_TextChanged(object sender, TextChangedEventArgs e)
+        => UpdateWatermarkVisibility();
+
+    /// <summary>根据焦点和内容状态控制 Watermark 可见性</summary>
+    private void UpdateWatermarkVisibility()
+    {
+        if (ChatWatermark == null || ChatInputBox == null) return;
+        var hasText = !string.IsNullOrEmpty(ChatInputBox.Text);
+        var isFocused = ChatInputBox.IsFocused;
+        ChatWatermark.Visibility = (!hasText && !isFocused) ? Visibility.Visible : Visibility.Collapsed;
+    }
+}

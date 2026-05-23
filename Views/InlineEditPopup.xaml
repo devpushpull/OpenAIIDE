@@ -1,0 +1,63 @@
+<Window x:Class="AIIDEWPF.Views.InlineEditPopup"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="内联编辑"
+        Width="520" Height="320"
+        WindowStartupLocation="CenterOwner"
+        WindowStyle="ToolWindow"
+        ResizeMode="CanResize"
+        Background="#2d2d2d" Foreground="#d4d4d4"
+        KeyDown="Window_KeyDown">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- 标题：选中的代码 -->
+        <TextBlock Grid.Row="0" Text="选中的代码：" Foreground="#888" FontSize="12" Margin="0,0,0,4"/>
+        <Border Grid.Row="1" Background="#1e1e1e" CornerRadius="4" Padding="8,6" Margin="0,0,0,8"
+                MaxHeight="80">
+            <TextBox x:Name="CodePreviewBox" Foreground="#9cdcfe" FontFamily="Consolas" FontSize="12"
+                     IsReadOnly="True" TextWrapping="NoWrap" VerticalScrollBarVisibility="Auto"
+                     BorderThickness="0" Background="Transparent"/>
+        </Border>
+
+        <!-- 指令输入 -->
+        <TextBlock Grid.Row="2" Text="编辑指令：" Foreground="#888" FontSize="12" Margin="0,0,0,4"/>
+        <TextBox x:Name="InstructionBox" Grid.Row="2" 
+                 Background="#3a3a3a" Foreground="#d4d4d4"
+                 BorderThickness="0" Padding="8,6"
+                 FontSize="13" TextWrapping="Wrap"
+                 AcceptsReturn="True" MinLines="2"
+                 VerticalScrollBarVisibility="Auto"
+                 VerticalAlignment="Stretch" Margin="0,0,0,8"
+                 Text="重构为 async/await 模式"/>
+
+        <!-- AI结果预览 -->
+        <TextBlock x:Name="ResultLabel" Grid.Row="3" Text="AI 生成的代码：" Foreground="#888" FontSize="12" 
+                   Margin="0,0,0,4" Visibility="Collapsed"/>
+        <Border x:Name="ResultBorder" Grid.Row="3" Background="#1e1e1e" CornerRadius="4" Padding="8,6" Margin="0,0,0,8"
+                MaxHeight="100" Visibility="Collapsed">
+            <TextBox x:Name="ResultBox" Foreground="#6a9955" FontFamily="Consolas" FontSize="12"
+                     IsReadOnly="True" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                     BorderThickness="0" Background="Transparent"/>
+        </Border>
+
+        <!-- 按钮栏 -->
+        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,4,0,0">
+            <Button x:Name="GenerateBtn" Content="✨ 生成" Width="70"
+                    Background="#007acc" Foreground="White" BorderThickness="0"
+                    Padding="6,6" Margin="0,0,8,0" Click="GenerateBtn_Click"/>
+            <Button x:Name="ApplyBtn" Content="✅ 替换" Width="70"
+                    Background="#2a6b2a" Foreground="White" BorderThickness="0"
+                    Padding="6,6" Margin="0,0,8,0" Click="ApplyBtn_Click" IsEnabled="False"/>
+            <Button Content="取消" Width="60"
+                    Background="#555" Foreground="#d4d4d4" BorderThickness="0"
+                    Padding="6,6" Click="CancelBtn_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

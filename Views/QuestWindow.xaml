@@ -1,0 +1,233 @@
+<Window x:Class="AIIDEWPF.Views.QuestWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:conv="clr-namespace:AIIDEWPF.Converters"
+        Title="Quest - 任务工作区" Height="700" Width="1100"
+        MinHeight="500" MinWidth="800"
+        Background="#1e1e1e" Foreground="#d4d4d4"
+        WindowStartupLocation="CenterOwner">
+
+    <Window.Resources>
+        <conv:BoolToVisibilityConverter x:Key="BoolToVis"/>
+        <conv:InverseBoolToVisibilityConverter x:Key="InverseBoolToVis"/>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="280"/>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- ===== 左侧：任务管理区 ===== -->
+        <Border Grid.Column="0" Background="#252526">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <!-- 工作区名称 -->
+                <Border Grid.Row="0" Padding="12,10" BorderBrush="#454545" BorderThickness="0,0,0,1">
+                    <StackPanel>
+                        <TextBlock Text="📁 Quest 工作区" FontSize="13" FontWeight="Bold" Foreground="#e0e0e0"/>
+                        <TextBlock Text="{Binding ProjectName}" FontSize="11" Foreground="#888" Margin="0,4,0,0" TextTrimming="CharacterEllipsis"/>
+                    </StackPanel>
+                </Border>
+
+                <!-- 任务列表 -->
+                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="8">
+                        <TextBlock Text="📋 任务列表" FontSize="11" FontWeight="SemiBold" Foreground="#888" Margin="0,0,0,8"/>
+
+                        <!-- 新建任务按钮 -->
+                        <Button Content="+ 新建任务" FontSize="12" Foreground="#569cd6" Background="Transparent"
+                                BorderThickness="0" Padding="8,6" HorizontalAlignment="Left" Cursor="Hand"
+                                Click="NewQuest_Click"/>
+
+                        <!-- 任务列表示例 -->
+                        <ItemsControl x:Name="QuestList" Margin="0,8,0,0">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Border Margin="0,2" Padding="10,8" Background="#2d2d2d" CornerRadius="4" Cursor="Hand"
+                                            MouseLeftButtonDown="QuestItem_Click">
+                                        <StackPanel>
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="Auto"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="0" Text="{Binding Title}" FontSize="12"
+                                                           Foreground="#d4d4d4" TextTrimming="CharacterEllipsis"/>
+                                                <Border Grid.Column="1" Padding="4,1" CornerRadius="3"
+                                                        Background="{Binding StatusColor}" Margin="6,0,0,0">
+                                                    <TextBlock Text="{Binding StatusText}" FontSize="9"
+                                                               Foreground="#fff"/>
+                                                </Border>
+                                            </Grid>
+                                            <TextBlock Text="{Binding Description}" FontSize="10" Foreground="#888"
+                                                       Margin="0,3,0,0" TextTrimming="CharacterEllipsis" MaxWidth="240"/>
+                                            <!-- 错误信息 -->
+                                            <TextBlock Text="{Binding LastError}" FontSize="9" Foreground="#f44747"
+                                                       Margin="0,3,0,0" TextTrimming="CharacterEllipsis" MaxWidth="240"
+                                                       Visibility="{Binding HasError, Converter={StaticResource BoolToVis}}"/>
+                                            <!-- 重试/继续按钮 -->
+                                            <StackPanel Orientation="Horizontal" Margin="0,6,0,0"
+                                                        Visibility="{Binding ShowRetryActions, Converter={StaticResource BoolToVis}}">
+                                                <Button Content="🔄 重试" FontSize="10" Height="24" Width="64"
+                                                        Background="#fd7e14" Foreground="White" BorderThickness="0"
+                                                        Cursor="Hand" Margin="0,0,6,0"
+                                                        Click="RetryQuest_Click"/>
+                                                <Button Content="▶ 继续" FontSize="10" Height="24" Width="64"
+                                                        Background="#007acc" Foreground="White" BorderThickness="0"
+                                                        Cursor="Hand"
+                                                        Visibility="{Binding CanContinue, Converter={StaticResource BoolToVis}}"
+                                                        Click="ContinueQuest_Click"/>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Border>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </StackPanel>
+                </ScrollViewer>
+
+                <!-- 底部工具区 -->
+                <Border Grid.Row="2" Padding="10,8" Background="#1e1e1e" BorderBrush="#454545" BorderThickness="0,1,0,0">
+                    <StackPanel>
+                        <TextBlock Text="⚙ 工具" FontSize="11" FontWeight="SemiBold" Foreground="#888" Margin="0,0,0,6"/>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="💡" FontSize="12" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                            <TextBlock Text="知识中心" FontSize="11" Foreground="#aaa" VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+            </Grid>
+        </Border>
+
+        <!-- 分隔条 -->
+        <GridSplitter Grid.Column="1" Width="3" Background="#454545" HorizontalAlignment="Stretch"
+                      ResizeBehavior="PreviousAndNext"/>
+
+        <!-- ===== 右侧：会话区 + 功能区 ===== -->
+        <Grid Grid.Column="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- 中间：会话区 -->
+            <Grid Grid.Column="0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <!-- 模式选择 -->
+                <Border Grid.Row="0" Padding="12,8" BorderBrush="#454545" BorderThickness="0,0,0,1">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="🤖 模式：" FontSize="12" Foreground="#aaa" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                        <Button x:Name="AgentModeBtn" Content="Agent" Width="64" Height="26" FontSize="11"
+                                Background="#007acc" Foreground="White" BorderThickness="0" Margin="0,0,4,0"
+                                Click="AgentMode_Click"/>
+                        <Button x:Name="ExpertsModeBtn" Content="Experts" Width="64" Height="26" FontSize="11"
+                                Background="#2d2d2d" Foreground="#aaa" BorderThickness="1" BorderBrush="#454545"
+                                Click="ExpertsMode_Click"/>
+                    </StackPanel>
+                </Border>
+
+                <!-- 会话消息区 -->
+                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                    <Border Padding="12">
+                        <StackPanel>
+                            <Border Background="#2d2d2d" CornerRadius="8" Padding="16,12" Margin="0,0,0,12">
+                                <StackPanel>
+                                    <TextBlock Text="👋 欢迎使用 Quest" FontSize="14" FontWeight="Bold" Foreground="#e0e0e0"/>
+                                    <TextBlock Text="Quest 是面向 Agent-first 工作范式的任务工作台。" FontSize="12"
+                                               Foreground="#aaa" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                                    <TextBlock FontSize="12" Foreground="#888" TextWrapping="Wrap" Margin="0,4,0,0">
+                                        <Run Text="• 选择 "/><Run Text="Agent" Foreground="#4ec9b0"/>
+                                        <Run Text=" 模式：由智能体自主执行，端到端交付任务。"/>
+                                        <LineBreak/>
+                                        <Run Text="• 选择 "/><Run Text="Experts" Foreground="#c0a060"/>
+                                        <Run Text=" 模式：多智能体协同并行，适合复杂项目。"/>
+                                    </TextBlock>
+                                </StackPanel>
+                            </Border>
+
+                            <!-- 会话消息列表 -->
+                            <TextBlock Text="在下方输入框中描述任务，AI 将自主执行。" FontSize="11" Foreground="#888" Margin="0,8,0,0"/>
+                        </StackPanel>
+                    </Border>
+                </ScrollViewer>
+
+                <!-- 余额状态栏 -->
+                <Border x:Name="BalanceStatusBar" Grid.Row="2" Padding="12,6" 
+                        Background="#2a2a2a" BorderBrush="#454545" BorderThickness="0,1,0,0"
+                        Visibility="Collapsed">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <!-- 模型名称 -->
+                        <Border Grid.Column="0" Padding="6,2" CornerRadius="3" Background="#3a3a3a" Margin="0,0,8,0">
+                            <TextBlock x:Name="BalanceModelName" Text="DeepSeek V4" FontSize="11" Foreground="#8cc8ff"/>
+                        </Border>
+                        <!-- 用量/余额信息 -->
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                            <TextBlock x:Name="BalanceSessionCost" Text="会话: ¥0.00" FontSize="11" Foreground="#888" Margin="0,0,12,0"/>
+                            <TextBlock x:Name="BalanceQuotaInfo" Text="" FontSize="11" Foreground="#888" Margin="0,0,12,0"/>
+                            <!-- 用量进度条 -->
+                            <Border Width="80" Height="6" CornerRadius="3" Background="#3a3a3a" Margin="0,0,8,0">
+                                <Border x:Name="BalanceProgressBar" Width="0" CornerRadius="3" Background="#4ec9b0" HorizontalAlignment="Left"/>
+                            </Border>
+                            <TextBlock x:Name="BalancePercentText" Text="" FontSize="10" Foreground="#888"/>
+                        </StackPanel>
+                        <!-- 提醒消息 -->
+                        <TextBlock x:Name="BalanceWarningText" Grid.Column="2" FontSize="10" 
+                                   Foreground="#fd7e14" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="260"/>
+                    </Grid>
+                </Border>
+
+                <!-- 输入区 -->
+                <Border Grid.Row="3" Padding="12,8" BorderBrush="#454545" BorderThickness="0,1,0,0" Background="#1e1e1e">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <TextBox x:Name="QuestInputBox" Grid.Row="0"
+                                 Background="#3a3a3a" Foreground="#d4d4d4" BorderThickness="0"
+                                 Padding="10,8" FontSize="13" TextWrapping="Wrap"
+                                 AcceptsReturn="True" MinHeight="50" MaxHeight="120"
+                                 IsEnabled="{Binding Chat.IsNotStreaming}"
+                                 PreviewKeyDown="QuestInput_KeyDown"/>
+                        <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,6,0,0">
+                            <Button Content="发送任务" Width="80" Height="28"
+                                    Background="#007acc" Foreground="White" BorderThickness="0"
+                                    FontSize="12" FontWeight="SemiBold" Cursor="Hand"
+                                    Click="QuestSend_Click"/>
+                        </StackPanel>
+                    </Grid>
+                </Border>
+            </Grid>
+
+            <!-- 右侧：功能区（折叠按钮） -->
+            <Border Grid.Column="1" Background="#252526" Width="48">
+                <StackPanel VerticalAlignment="Top" Margin="0,8,0,0">
+                    <Button Content="📊" Width="36" Height="36" Background="Transparent" Foreground="#aaa"
+                            BorderThickness="0" FontSize="14" Cursor="Hand" ToolTip="概要"/>
+                    <Button Content="📁" Width="36" Height="36" Background="Transparent" Foreground="#aaa"
+                            BorderThickness="0" FontSize="14" Cursor="Hand" ToolTip="文件树"/>
+                    <Button Content="🖥" Width="36" Height="36" Background="Transparent" Foreground="#aaa"
+                            BorderThickness="0" FontSize="14" Cursor="Hand" ToolTip="终端"/>
+                </StackPanel>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>

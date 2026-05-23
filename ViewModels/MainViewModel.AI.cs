@@ -1,0 +1,834 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.IO;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
+using System.Windows;
+using AIIDEWPF.Models;
+using AIIDEWPF.Services;
+
+namespace AIIDEWPF.ViewModels;
+
+public partial class MainViewModel
+{
+    public async void SendMessage()
+    {
+        if (!RequireAuth("发送消息")) return;
+        if (string.IsNullOrEmpty(Chat.InputText)) return;
+
+        if (_aiService.UsageTracker.IsQuotaExhausted)
+        {
+            ShowQuotaExhaustedDialog(_aiService.UsageTracker.WarningMessage ?? "API 余额/配额已完全耗尽。");
+            return;
+        }
+
+        var providerId = _modelManager.ActiveProvider?.Id ?? "";
+        var apiKey = _modelManager.GetEffectiveApiKey(providerId);
+        if (string.IsNullOrEmpty(apiKey))
+        {
+            var modelName = _modelManager.ActiveModel?.Name ?? _modelManager.ActiveModel?.Id ?? "当前模型";
+            var providerName = _modelManager.ActiveProvider?.Name ?? "当前提供商";
+
+            // 检查是否最近已显示过同类 API Key 警告，避免重复刷屏
+            var lastSysMsg = Chat.Messages.LastOrDefault(m => m.Role == "system");
+            bool alreadyWarned = lastSysMsg != null && lastSysMsg.Content.Contains("尚未配置");
+
+            // 两层检查：先判断是否完全未配置任何 API Key
+            if (!_modelManager.HasAnyApiKeyConfigured())
+            {
+                Chat.AIStatus = "⚠️ 未配置 API Key";
+                if (!alreadyWarned)
+                    Chat.AddMessage("system",
+                        "⚠️ **尚未配置任何大模型 API Key**，无法发送消息。\n\n" +
+                        "💡 请前往 **设置 → 管理模型**（右上角齿轮图标或菜单 → 设置 → 管理模型）配置 API Key 后再使用。");
+            }
+            else
+            {
+                Chat.AIStatus = $"⚠️ {providerName}/{modelName}: 未配置 API Key";
+                if (!alreadyWarned)
+                    Chat.AddMessage("system",
+                        $"⚠️ **{providerName} / {modelName}** 尚未配置 API Key，无法发送消息。\n\n" +
+                        "💡 请前往 **设置 → 管理模型**（右上角齿轮图标或菜单 → 设置 → 管理模型）配置该模型的 API Key，或切换到其他已配置的模型。");
+            }
+            return;
+        }
+
+        if (Chat.IsStreaming)
+        {
+            var queuedMsg = Chat.InputText.Trim();
+            if (string.IsNullOrEmpty(queuedMsg)) return;
+            Chat.EnqueuePendingMessage(queuedMsg);
+            Chat.InputText = string.Empty;
+            return;
+        }
+
+        UpdateContextUsage();
+
+        if (string.IsNullOrEmpty(FileTree.ProjectPath))
+        {
+            Chat.AddMessage("system", "请先新建或打开一个项目/文件夹，AI 需要在项目目录下工作。使用菜单 文件 → 打开项目 或 文件 → 新建项目。");
+            return;
+        }
+
+        _aiService.SetProjectPath(FileTree.ProjectPath);
+        _atMentionService.SetProjectPath(FileTree.ProjectPath);
+        _gitService.SetRepoPath(FileTree.ProjectPath);
+        _slashCommandService.SetProjectPath(FileTree.ProjectPath);
+        _codeClipDetector?.SetProjectPath(FileTree.ProjectPath);
+        _gitConfig = GitConfigStore.Load(FileTree.ProjectPath);
+        _chatModeService.ActiveModeId = Chat.ChatMode;
+
+        var msg = Chat.InputText.Trim();
+
+        var indexContext = "";
+        if (_codeIndexService != null && _codeIndexService.IsBuilt)
+        {
+            indexContext = _codeIndexService.BuildContextForAI(msg, maxFiles: 5, maxCharsPerFile: 3000);
+            if (!string.IsNullOrEmpty(indexContext))
+                LogService.Instance.Info($"自动上下文注入: {_codeIndexService.FileCount} 索引文件中匹配相关代码", "CodeIndex");
+        }
+
+        var correctedMsg = _inputCorrection.Correct(msg, out var wasCorrected);
+        if (wasCorrected)
+        {
+            InputCorrectionHint = $"✏️ 已自动纠正 {_inputCorrection.LastCorrectionDetail}";
+            msg = correctedMsg;
+        }
+        else
+        {
+            InputCorrectionHint = string.Empty;
+        }
+
+        Chat.CurrentFiles = new ObservableCollection<string>();
+        if (!string.IsNullOrEmpty(Editor.CurrentFile))
+            Chat.CurrentFiles.Add(Editor.CurrentFile);
+
+        var (privacyStatus, privacyMsg) = PrivacyHelper.Check(msg);
+        if (privacyStatus == PrivacyHelper.CheckResult.Blocked)
+        {
+            Chat.AddMessage("system", privacyMsg);
+            return;
+        }
+        if (privacyStatus == PrivacyHelper.CheckResult.Warned)
+        {
+            var result = System.Windows.MessageBox.Show(
+                privacyMsg + "\n\n确认发送包含上述凭据的内容？",
+                "隐私提醒",
+                System.Windows.MessageBoxButton.YesNo,
+                System.Windows.MessageBoxImage.Warning);
+            if (result != System.Windows.MessageBoxResult.Yes)
+            {
+                Chat.AddMessage("system", "已取消发送。建议使用环境变量或配置文件管理敏感凭据。");
+                return;
+            }
+        }
+
+        if (msg.StartsWith("/plan", StringComparison.OrdinalIgnoreCase))
+        {
+            var planTask = msg["/plan".Length..].Trim();
+            if (string.IsNullOrEmpty(planTask))
+                Chat.PendingPlanMessage = "请分析当前项目，生成一个开发改进计划";
+            else
+                Chat.PendingPlanMessage = planTask;
+
+            var planningPrompt = _promptService.GetPlanningPrompt(Chat.PendingPlanMessage);
+            _promptService.AddSection(planningPrompt);
+
+            Chat.PlanStatus = "generating";
+            Chat.PlanTitle = "计划生成中...";
+            Chat.IsPlanExpanded = true;
+        }
+
+        if (Chat.PlanStatus == "none" && IsComplexTask(msg))
+        {
+            _pendingSuggestionMessage = msg;
+            Chat.PlanSuggestionText = "检测到复杂任务，建议先生成开发计划再执行。";
+            Chat.IsPlanSuggestionVisible = true;
+            Chat.InputText = string.Empty;
+            return;
+        }
+
+        Chat.InputText = string.Empty;
+        Chat.IsStreaming = true;
+        Chat.AIStatus = "AI: 就绪";
+        _scheduler.SetStreaming(true);
+        _scheduler.NotifyUserActivity();
+        BackgroundTaskCount++;
+        BackgroundTaskSummary = "AI 代码生成中...";
+
+        var displayMsg = !string.IsNullOrEmpty(Chat.PendingPlanMessage) ? Chat.PendingPlanMessage : msg;
+        Chat.AddMessage("user", displayMsg);
+
+        _thinkingMsg = Chat.AddMessage("system", Chat.PlanStatus == "generating" ? "正在生成开发计划..." : "正在思考...");
+
+        var currentFile = Editor.CurrentFile;
+        var context = "";
+        if (!string.IsNullOrEmpty(currentFile))
+        {
+            try { context = $"Current file: {currentFile}\n{_fileService.ReadFile(currentFile)}"; }
+            catch { }
+        }
+
+        var attachmentCtx = _attachmentService.BuildContext();
+        if (!string.IsNullOrEmpty(attachmentCtx))
+            context = (context ?? "") + "\n" + attachmentCtx;
+
+        var fileRefCtx = ResolveAtFileReferences(msg);
+        if (!string.IsNullOrEmpty(fileRefCtx))
+            context = (context ?? "") + "\n" + fileRefCtx;
+
+        if (!string.IsNullOrEmpty(indexContext))
+            context = (context ?? "") + "\n" + indexContext;
+
+        // 注入用户记忆库到上下文
+        var memoryCtx = MemorySvc?.FormatForAI(FileTree.ProjectPath);
+        if (!string.IsNullOrEmpty(memoryCtx))
+            context = (context ?? "") + "\n" + memoryCtx;
+
+        // 注入用户提示词库到上下文
+        var promptLibCtx = PromptLibrarySvc?.FormatForAI(FileTree.ProjectPath);
+        if (!string.IsNullOrEmpty(promptLibCtx))
+            context = (context ?? "") + "\n" + promptLibCtx;
+
+        // 注入历史学习经验到上下文
+        var learnCtx = LearningSvc?.FormatForAI(FileTree.ProjectPath);
+        if (!string.IsNullOrEmpty(learnCtx))
+            context = (context ?? "") + "\n" + learnCtx;
+
+        // pre_ai_call 钩子
+        _ = _hooksService?.RunHooksAsync("pre_ai_call", new Dictionary<string, string>
+        {
+            ["PROJECT"] = FileTree.ProjectPath ?? ""
+        });
+
+        if (Chat.IsCompareMode && !string.IsNullOrEmpty(Chat.CompareModelId))
+        {
+            var primaryLabel = _modelManager.ActiveModel?.Name ?? _modelManager.ActiveModel?.Id ?? "主模型";
+            _pendingModelLabels.Enqueue($"📊 {primaryLabel}");
+            await _aiService.SendStreamMessageAsync(msg, context);
+
+            var compareLabel = Chat.CompareModelId;
+            _pendingModelLabels.Enqueue($"📊 {compareLabel}");
+            await _aiService.SendStreamMessageAsync(msg, context, Chat.CompareModelId);
+        }
+        else
+        {
+            await _aiService.SendStreamMessageAsync(msg, context);
+        }
+        _attachmentService.Clear();
+        SyncAttachmentsToChat();
+    }
+
+    private static bool IsComplexTask(string msg)
+    {
+        if (msg.Length < 60) return false;
+
+        var complexityKeywords = new[]
+        {
+            "实现", "重构", "改造", "新建", "开发", "架构", "设计",
+            "迁移", "升级", "集成", "优化性能", "多线程", "并发",
+            "数据库", "缓存", "中间件", "API", "接口", "模块", "插件",
+            "全栈", "端到端", "整体", "全部", "整个", "所有",
+            "implement", "refactor", "migrate", "build", "create a"
+        };
+
+        var msgLower = msg.ToLower();
+        int hitCount = complexityKeywords.Count(k => msgLower.Contains(k.ToLower()));
+
+        return hitCount >= 2 || msg.Length > 300;
+    }
+
+    private string ResolveAtFileReferences(string msg)
+    {
+        var sb = new System.Text.StringBuilder();
+        var regex = new System.Text.RegularExpressions.Regex(@"@file:([^\s]+)");
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (System.Text.RegularExpressions.Match m in regex.Matches(msg))
+        {
+            var relPath = m.Groups[1].Value.Trim();
+            if (seen.Contains(relPath)) continue;
+            seen.Add(relPath);
+
+            var fullPath = System.IO.Path.Combine(FileTree.ProjectPath, relPath.Replace('/', System.IO.Path.DirectorySeparatorChar));
+            if (System.IO.File.Exists(fullPath))
+            {
+                try
+                {
+                    var content = System.IO.File.ReadAllText(fullPath);
+                    var ext = System.IO.Path.GetExtension(fullPath).TrimStart('.');
+                    sb.AppendLine($"\n## 📄 @file:{relPath}");
+                    sb.AppendLine($"```{ext}");
+                    sb.AppendLine(TruncateText(content, 8000));
+                    sb.AppendLine("```");
+                }
+                catch { }
+            }
+        }
+        return sb.ToString();
+    }
+
+    private static string TruncateText(string text, int maxChars)
+    {
+        if (text.Length <= maxChars) return text;
+        return text[..maxChars] + $"\n... (截断 {text.Length - maxChars} 字符)";
+    }
+
+    public async void ConfirmPlan()
+    {
+        if (Chat.PlanStatus != "pending_approval" || Chat.IsStreaming) return;
+
+        Chat.ApprovePlan();
+        Chat.AIStatus = "AI: 按计划执行...";
+
+        var msg = $"请按照上述计划逐步实施。每完成一步，使用 todo_write 更新对应待办项的状态为 completed。" +
+                  $"遇到问题及时反馈。\n\n" +
+                  $"全部完成后，请用一条清晰的消息总结执行结果，包括：\n" +
+                  $"1. 已完成哪些任务\n" +
+                  $"2. 修改了哪些文件\n" +
+                  $"3. 如有未完成项，说明原因\n\n" +
+                  $"原始任务：{Chat.PendingPlanMessage}";
+
+        Chat.AddMessage("system", "🚀 开始按计划执行...");
+        Chat.IsStreaming = true;
+        _scheduler.SetStreaming(true);
+        _scheduler.NotifyUserActivity();
+
+        await _aiService.SendStreamMessageAsync(msg, null);
+    }
+
+    private async void OnPlanSuggestionAccepted(bool generatePlan)
+    {
+        if (_isCrashRecoveryMode)
+        {
+            _isCrashRecoveryMode = false;
+            if (generatePlan) RestoreFromCrash();
+            else DiscardCrashRecovery();
+            return;
+        }
+
+        if (_pendingSuggestionMessage == null) return;
+
+        var msg = _pendingSuggestionMessage;
+        _pendingSuggestionMessage = null;
+
+        if (generatePlan)
+        {
+            Chat.PendingPlanMessage = msg;
+            var planningPrompt = _promptService.GetPlanningPrompt(msg);
+            _promptService.AddSection(planningPrompt);
+            Chat.PlanStatus = "generating";
+            Chat.PlanTitle = "计划生成中...";
+            Chat.IsPlanExpanded = true;
+        }
+
+        var indexContext = "";
+        if (_codeIndexService != null && _codeIndexService.IsBuilt)
+        {
+            indexContext = _codeIndexService.BuildContextForAI(msg, maxFiles: 5, maxCharsPerFile: 3000);
+            if (!string.IsNullOrEmpty(indexContext))
+                LogService.Instance.Info($"自动上下文注入: {_codeIndexService.FileCount} 索引文件中匹配相关代码", "CodeIndex");
+        }
+
+        Chat.InputText = string.Empty;
+        Chat.IsStreaming = true;
+        Chat.AIStatus = "AI: 就绪";
+        _scheduler.SetStreaming(true);
+        _scheduler.NotifyUserActivity();
+        BackgroundTaskCount++;
+        BackgroundTaskSummary = generatePlan ? "AI 计划生成中..." : "AI 代码生成中...";
+
+        Chat.AddMessage("user", msg);
+        _thinkingMsg = Chat.AddMessage("system", generatePlan ? "正在生成开发计划..." : "正在思考...");
+
+        var currentFile = Editor.CurrentFile;
+        var context = "";
+        if (!string.IsNullOrEmpty(currentFile))
+        {
+            try { context = $"Current file: {currentFile}\n{_fileService.ReadFile(currentFile)}"; }
+            catch { }
+        }
+
+        var attachmentCtx = _attachmentService.BuildContext();
+        if (!string.IsNullOrEmpty(attachmentCtx))
+            context = (context ?? "") + "\n" + attachmentCtx;
+
+        var fileRefCtx = ResolveAtFileReferences(msg);
+        if (!string.IsNullOrEmpty(fileRefCtx))
+            context = (context ?? "") + "\n" + fileRefCtx;
+
+        if (!string.IsNullOrEmpty(indexContext))
+            context = (context ?? "") + "\n" + indexContext;
+
+        // 注入用户记忆库到上下文
+        var memoryCtx = MemorySvc?.FormatForAI(FileTree.ProjectPath);
+        if (!string.IsNullOrEmpty(memoryCtx))
+            context = (context ?? "") + "\n" + memoryCtx;
+
+        // 注入用户提示词库到上下文
+        var promptLibCtx2 = PromptLibrarySvc?.FormatForAI(FileTree.ProjectPath);
+        if (!string.IsNullOrEmpty(promptLibCtx2))
+            context = (context ?? "") + "\n" + promptLibCtx2;
+
+        // 注入历史学习经验到上下文
+        var learnCtx2 = LearningSvc?.FormatForAI(FileTree.ProjectPath);
+        if (!string.IsNullOrEmpty(learnCtx2))
+            context = (context ?? "") + "\n" + learnCtx2;
+
+        await _aiService.SendStreamMessageAsync(msg, context);
+        _attachmentService.Clear();
+        SyncAttachmentsToChat();
+    }
+
+    public void CancelPlan()
+    {
+        if (Chat.PlanStatus == "none") return;
+
+        var result = System.Windows.MessageBox.Show(
+            "确定放弃当前开发计划吗？已完成的步骤不会被撤销。",
+            "放弃计划",
+            System.Windows.MessageBoxButton.YesNo,
+            System.Windows.MessageBoxImage.Question);
+
+        if (result == System.Windows.MessageBoxResult.Yes)
+        {
+            Chat.AddMessage("system", "📋 计划已放弃。");
+            Chat.ResetPlan();
+        }
+    }
+
+    public void ShowPlanDetail() => Chat.PlanDetailExpanded = !Chat.PlanDetailExpanded;
+    public void HidePlanDetail() => Chat.PlanDetailExpanded = false;
+
+    public async void Replan()
+    {
+        if (Chat.PlanStatus == "none" || Chat.IsStreaming) return;
+
+        var completed = Chat.Todos.Where(t => t.Status == "completed").Select(t => t.Content);
+        var pending = Chat.Todos.Where(t => t.Status != "completed");
+
+        Chat.PlanStatus = "generating";
+        Chat.AIStatus = "AI: 重新规划...";
+        Chat.IsStreaming = true;
+        _scheduler.SetStreaming(true);
+        _scheduler.NotifyUserActivity();
+
+        var msg = $"请基于当前进展重新调整开发计划。\n\n" +
+                  $"已完成步骤：\n{string.Join("\n", completed.Select(c => "- " + c))}\n\n" +
+                  $"剩余步骤：\n{string.Join("\n", pending.Select(t => $"- [{t.Status}] {t.Content}"))}\n\n" +
+                  $"请重新生成更合理的计划（使用 todo_write），并保持已完成任务的 completed 状态。\n\n" +
+                  $"原始任务：{Chat.PendingPlanMessage}";
+
+        Chat.AddMessage("system", "🔄 正在重新规划...");
+
+        await _aiService.SendStreamMessageAsync(msg, null);
+    }
+
+    private void OnAIChunk(string chunk)
+    {
+        if (string.IsNullOrEmpty(chunk)) return;
+
+        Application.Current.Dispatcher.Invoke(() =>
+        {
+            if (_thinkingMsg != null)
+            {
+                Chat.Messages.Remove(_thinkingMsg);
+                _thinkingMsg = null;
+            }
+            if (_currentStreamingMsg == null)
+            {
+                _currentStreamingMsg = Chat.AddMessage("assistant", "");
+                if (_pendingModelLabels.Count > 0)
+                    _currentStreamingMsg.ModelLabel = _pendingModelLabels.Dequeue();
+            }
+            _currentStreamingMsg.Content += chunk;
+
+            if (_reasoningMsg != null)
+            {
+                _reasoningMsg.IsStreaming = false;
+                _reasoningMsg.CollapseReasoning();
+                _reasoningMsg = null;
+            }
+        });
+    }
+
+    private void OnAIToolCall(Models.ToolCall tc)
+    {
+        Application.Current.Dispatcher.Invoke(() =>
+        {
+            if (tc.Status == "running")
+                Chat.AIStatus = $"AI: 执行 {tc.Name}...";
+            else
+                Chat.AIStatus = "AI: 就绪";
+        });
+    }
+
+    private void OnAIDone(string type, string content)
+    {
+        Application.Current.Dispatcher.Invoke(() =>
+        {
+            Chat.IsStreaming = false;
+            Chat.AIStatus = "AI: 就绪";
+            _currentStreamingMsg = null;
+            _scheduler.SetStreaming(false);
+            if (BackgroundTaskCount > 0) BackgroundTaskCount--;
+            if (BackgroundTaskCount == 0) BackgroundTaskSummary = "";
+            UpdateContextUsage();
+            if (_thinkingMsg != null)
+            {
+                Chat.Messages.Remove(_thinkingMsg);
+                _thinkingMsg = null;
+            }
+            if (_reasoningMsg != null)
+            {
+                _reasoningMsg.IsStreaming = false;
+                _reasoningMsg.CollapseReasoning();
+                _reasoningMsg = null;
+            }
+
+            if (type == "tool_continue")
+            {
+                // AI 需要继续调用工具（任务尚未完成）
+                _ = _aiService.ContinueWithToolResultsAsync();
+            }
+            else
+            {
+                // type == "done" — 最终完成
+                // post_ai_call 钩子
+                _ = _hooksService?.RunHooksAsync("post_ai_call", new Dictionary<string, string>
+                {
+                    ["PROJECT"] = FileTree.ProjectPath ?? ""
+                });
+
+                _questWindow?.OnQuestCompleted();
+
+                // 计划执行完成 → 自动生成结果摘要并更新待办列表
+                if (Chat.PlanStatus == "executing")
+                {
+                    var total = Chat.Todos.Count;
+                    var cancelled = Chat.Todos.Count(t => t.Status == "cancelled");
+
+                    // 将仍在进行的待办项标记为完成（AI 已结束对话即视为已完成）
+                    foreach (var t in Chat.Todos.Where(t => t.Status == "in_progress").ToList())
+                        t.Status = "completed";
+
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine("📊 任务执行结果:");
+                    if (total > 0)
+                    {
+                        var finalCompleted = Chat.Todos.Count(t => t.Status == "completed");
+                        var finalPending = Chat.Todos.Count(t => t.Status == "pending");
+                        sb.Append($"  ✅ {finalCompleted}/{total} 项已完成");
+                        if (cancelled > 0) sb.Append($"，❌ {cancelled} 项已取消");
+                        if (finalPending > 0) sb.Append($"，⏳ {finalPending} 项未完成");
+                        sb.AppendLine();
+                    }
+                    sb.AppendLine("  如需继续完善，请描述新需求。");
+
+                    Chat.AddMessage("system", sb.ToString());
+                    Chat.PlanStatus = "completed";
+                    Chat.CurrentExecutingStep = "";
+                }
+            }
+
+            RefreshAlgorithmList();
+
+            // 自我学习：从AI响应中自动提取有价值经验
+            if (type == "done" && !string.IsNullOrEmpty(content) && LearningSvc != null)
+            {
+                var lastUserMsg = Chat.Messages.LastOrDefault(m => m.Role == "user")?.Content ?? "";
+                var suggestions = LearningSvc.AutoExtract(content, lastUserMsg, FileTree.ProjectPath);
+                foreach (var (title, excerpt, category, confidence) in suggestions)
+                {
+                    LearningSvc.Record(title, excerpt, category, "auto_detected", confidence, FileTree.ProjectPath);
+                }
+            }
+
+            if (Chat.HasPendingMessages)
+            {
+                var nextMsg = Chat.DequeuePendingMessage();
+                if (!string.IsNullOrEmpty(nextMsg))
+                {
+                    Chat.InputText = nextMsg;
+                    SendMessage();
+                }
+            }
+        });
+    }
+
+    private void OnAIError(string error)
+    {
+        Application.Current.Dispatcher.Invoke(() =>
+        {
+            Chat.IsStreaming = false;
+            Chat.AIStatus = "AI: 请求失败，请重试";
+            _currentStreamingMsg = null;
+            _scheduler.SetStreaming(false);
+            if (BackgroundTaskCount > 0) BackgroundTaskCount--;
+            if (BackgroundTaskCount == 0) BackgroundTaskSummary = "";
+            if (_thinkingMsg != null)
+            {
+                Chat.Messages.Remove(_thinkingMsg);
+                _thinkingMsg = null;
+            }
+            LogService.Instance.Error($"AI 调用失败: {error}", "AI");
+
+            if (IsQuotaExhaustedError(error))
+                ShowQuotaExhaustedDialog(error);
+
+            _questWindow?.OnQuestError(string.IsNullOrEmpty(error) ? "未知网络/API 错误" : error);
+
+            // 构建带计划上下文的中断消息
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine($"⚠️ 任务因故中断");
+            sb.AppendLine($"原因: {error}");
+
+            // 如果是计划执行中，附加计划进度信息
+            if (Chat.PlanStatus == "executing" && Chat.Todos.Count > 0)
+            {
+                var completed = Chat.Todos.Count(t => t.Status == "completed");
+                var total = Chat.Todos.Count;
+                var current = Chat.Todos.FirstOrDefault(t => t.Status == "in_progress");
+                sb.AppendLine($"进度: {completed}/{total} 项已完成");
+                if (current != null)
+                    sb.AppendLine($"中断位置: {current.Content}");
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("💡 请点击左侧 Quest 窗口任务列表中的「🔄 重试」按钮重新开始任务，或点击「▶ 继续」从中断点继续。");
+
+            Chat.AddMessage("system", sb.ToString());
+        });
+    }
+
+    private static bool IsQuotaExhaustedError(string error)
+    {
+        if (string.IsNullOrEmpty(error)) return false;
+        var lower = error.ToLowerInvariant();
+        return lower.Contains("配额") || lower.Contains("quota") || lower.Contains("余额") ||
+               lower.Contains("耗尽") || lower.Contains("insufficient") ||
+               lower.Contains("billing") || lower.Contains("计费");
+    }
+
+    private void ShowQuotaExhaustedDialog(string msg)
+    {
+        Application.Current.Dispatcher.Invoke(() =>
+        {
+            var result = MessageBox.Show(
+                $"{msg}\n\n" +
+                "💡 建议操作：\n" +
+                "  1. 前往大模型开放平台充值余额\n" +
+                "  2. 切换到其他可用模型（设置 → 模型管理）\n" +
+                "  3. 更换 API Key\n" +
+                "  4. 等待配额周期重置（每小时/每天自动重置）\n\n" +
+                "是否打开设置页面管理模型？",
+                "⚠ 余额/配额已耗尽",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Error);
+
+            if (result == MessageBoxResult.Yes)
+                ShowSettings();
+        });
+    }
+
+    private void OnAIFileChanged(string filePath)
+    {
+        Application.Current.Dispatcher.Invoke(() =>
+        {
+            if (!string.IsNullOrEmpty(FileTree.ProjectPath))
+                RefreshFileTree(FileTree.ProjectPath);
+            var existing = Chat.FileChanges.FirstOrDefault(f => f.FilePath == filePath);
+            if (existing == null)
+            {
+                var changeType = File.Exists(filePath) ? "modified" : "created";
+                Chat.FileChanges.Add(new FileChangeItem
+                {
+                    FilePath = filePath,
+                    ChangeType = changeType,
+                    CheckpointId = _aiService.CurrentCheckpointId,
+                    Description = $"AI 自动{changeType switch { "modified" => "修改", "created" => "创建", _ => "变更" }}: {Path.GetFileName(filePath)}"
+                });
+            }
+            else
+            {
+                existing.CheckpointId = _aiService.CurrentCheckpointId;
+            }
+            if (_projectConfig.IsLoaded)
+                _projectConfig.RecordFileChange(Path.GetRelativePath(FileTree.ProjectPath, filePath), File.Exists(filePath) ? "modified" : "created");
+            if (File.Exists(filePath))
+                OpenFile(filePath);
+            RefreshAlgorithmList();
+            RefreshGitChangesPanel();
+        });
+    }
+
+    private void OnAITodoWrite(List<(string content, string status)> todos)
+    {
+        Application.Current.Dispatcher.Invoke(() =>
+        {
+            var existingMap = Chat.Todos.ToDictionary(t => t.Content, t => t);
+
+            Chat.Todos.Clear();
+            foreach (var (content, status) in todos)
+            {
+                if (existingMap.TryGetValue(content, out var existing))
+                {
+                    var finalStatus = ResolveTodoStatus(existing.Status, status);
+                    Chat.Todos.Add(new TodoItem { Content = content, Status = finalStatus });
+                    existingMap.Remove(content);
+                }
+                else
+                {
+                    Chat.Todos.Add(new TodoItem { Content = content, Status = status });
+                }
+            }
+
+            if (Chat.Todos.Count > 0)
+                Chat.IsTodoExpanded = true;
+
+            if (Chat.PlanStatus == "generating")
+            {
+                var lastAssistantMsg = Chat.Messages.LastOrDefault(m => m.Role == "assistant");
+                if (lastAssistantMsg != null && !string.IsNullOrEmpty(lastAssistantMsg.Content))
+                    Chat.PlanDetail = lastAssistantMsg.Content;
+
+                Chat.SetPlanPending(Chat.PendingPlanMessage.Length > 80
+                    ? Chat.PendingPlanMessage[..80] + "..."
+                    : Chat.PendingPlanMessage);
+                Chat.AddMessage("system",
+                    "📋 开发计划已生成，请审阅后点击「确认并执行」开始实施（或输入'确认'继续执行）。");
+            }
+
+            if (Chat.PlanStatus == "executing")
+            {
+                var inProgress = Chat.Todos.FirstOrDefault(t => t.Status == "in_progress");
+                if (inProgress != null)
+                    Chat.CurrentExecutingStep = $"当前: {inProgress.Content}";
+            }
+        });
+    }
+
+    private static string ResolveTodoStatus(string existingStatus, string newStatus)
+    {
+        var priority = new Dictionary<string, int>
+        {
+            ["cancelled"] = 0, ["pending"] = 1, ["in_progress"] = 2, ["completed"] = 3
+        };
+        var existingP = priority.GetValueOrDefault(existingStatus, 1);
+        var newP = priority.GetValueOrDefault(newStatus, 1);
+        return newP >= existingP ? newStatus : existingStatus;
+    }
+
+    private void OnAIReasoningChunk(string chunk)
+    {
+        if (string.IsNullOrEmpty(chunk)) return;
+        Application.Current.Dispatcher.Invoke(() =>
+        {
+            if (_reasoningMsg == null)
+            {
+                _reasoningMsg = Chat.AddMessage("reasoning", "");
+                _reasoningMsg.IsStreaming = true;
+                _reasoningMsg.Content = chunk;
+                _reasoningMsg.ReasoningFullContent = chunk;
+                _reasoningMsg.IsReasoningCollapsed = false;
+            }
+            else
+            {
+                _reasoningMsg.Content += chunk;
+                _reasoningMsg.ReasoningFullContent += chunk;
+            }
+        });
+    }
+
+    private async Task<bool> OnPendingFileChangeAsync(string toolName, string filePath)
+    {
+        var tcs = new TaskCompletionSource<bool>();
+
+        var originalContent = "";
+        try { if (File.Exists(filePath)) originalContent = File.ReadAllText(filePath); } catch (Exception ex) { LogService.Instance.Debug($"Diff读取原文件失败 '{filePath}': {ex.Message}", "MainVM"); }
+
+        var change = new PendingFileChange
+        {
+            ToolName = toolName,
+            FilePath = filePath,
+            ChangeType = toolName,
+            Countdown = 3,
+            Confirmation = tcs,
+            OriginalContent = originalContent
+        };
+
+        Application.Current.Dispatcher.Invoke(() =>
+        {
+            Chat.PendingChanges.Add(change);
+            Chat.AddMessage("system", $"📝 待确认 {change.ChangeLabel}: {change.FileName}");
+        });
+
+        var timer = new System.Windows.Threading.DispatcherTimer(
+            TimeSpan.FromSeconds(1),
+            System.Windows.Threading.DispatcherPriority.Normal,
+            (s, e) =>
+            {
+                change.Countdown--;
+                if (change.Countdown <= 0)
+                {
+                    ((System.Windows.Threading.DispatcherTimer)s!).Stop();
+                    if (change.IsPending)
+                        Chat.AcceptChange(change);
+                }
+            },
+            Application.Current.Dispatcher);
+        timer.Start();
+
+        return await tcs.Task;
+    }
+
+    private async Task<bool> OnAllowExternalEditRequestedAsync()
+    {
+        var tcs = new TaskCompletionSource<bool>();
+
+        var item = new ExternalEditConsentItem
+        {
+            Title = "⚠️ 权限请求",
+            Detail = "AI 请求开启「允许修改项目外文件」权限。\n开启后 AI 将可以修改项目目录以外的任意文件。",
+            Timestamp = DateTime.Now,
+            Confirmation = tcs
+        };
+
+        Application.Current.Dispatcher.Invoke(() =>
+        {
+            Chat.ExternalEditConsents.Insert(0, item);
+            Chat.AddMessage("system", "⚠️ AI 请求开启「允许修改项目外文件」权限，这存在安全风险，请确认是否同意。");
+        });
+
+        return await tcs.Task;
+    }
+
+    /// <summary>
+    /// 沙箱/终端命令内联确认回调（三段式UI）
+    /// 左侧：不再询问/每次询问  中间：命令摘要  右侧：沙箱运行/终端
+    /// </summary>
+    private async Task<(bool accepted, string executionMode, string rememberPreference)> OnTerminalConsentRequestedAsync(string command, string summary)
+    {
+        var tcs = new TaskCompletionSource<(bool accepted, string executionMode, string rememberPreference)>();
+
+        var item = new TerminalConsentItem
+        {
+            Command = command,
+            Summary = summary,
+            Timestamp = DateTime.Now,
+            Confirmation = tcs
+        };
+
+        await Application.Current.Dispatcher.InvokeAsync(() =>
+        {
+            Chat.TerminalConsents.Insert(0, item);
+            Chat.AddMessage("system", $"🔐 AI 请求执行终端命令: {summary}");
+        });
+
+        var result = await tcs.Task;
+        return result;
+    }
+}

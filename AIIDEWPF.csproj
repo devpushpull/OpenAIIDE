@@ -1,0 +1,158 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>AIIDEWPF</AssemblyName>
+    <RootNamespace>AIIDEWPF</RootNamespace>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Version>1.0.0</Version>
+    <FileVersion>1.0.0</FileVersion>
+    <AssemblyVersion>1.0.0</AssemblyVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
+    <EnableDefaultPageItems>false</EnableDefaultPageItems>
+    <DefaultItemExcludes>$(DefaultItemExcludes);bak*\**;Tools\**;Tests\**</DefaultItemExcludes>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>true</GenerateTargetFrameworkAttribute>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ApplicationDefinition Include="App.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </ApplicationDefinition>
+    <Page Include="Views\MainFrameworkWindow.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\LoginWindow.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\ChangePasswordDialog.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\UserManagementDialog.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\WorkspaceView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\SettingsWindow.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\PluginManager.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\MCPManager.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\MCPEditDialog.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\AIDiffView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\GitSettingsDialog.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\UsageDashboardView.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\InlineEditPopup.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\QuestWindow.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\EnvironmentCheckDialog.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\KeyboardShortcutsDialog.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Page Include="Views\MaintenanceDialog.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
+    <Compile Update="App.xaml.cs">
+      <DependentUpon>App.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\MainFrameworkWindow.xaml.cs">
+      <DependentUpon>MainFrameworkWindow.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\LoginWindow.xaml.cs">
+      <DependentUpon>LoginWindow.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\ChangePasswordDialog.xaml.cs">
+      <DependentUpon>ChangePasswordDialog.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\UserManagementDialog.xaml.cs">
+      <DependentUpon>UserManagementDialog.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\WorkspaceView.xaml.cs">
+      <DependentUpon>WorkspaceView.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\SettingsWindow.xaml.cs">
+      <DependentUpon>SettingsWindow.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\PluginManager.xaml.cs">
+      <DependentUpon>PluginManager.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\MCPManager.xaml.cs">
+      <DependentUpon>MCPManager.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\MCPEditDialog.xaml.cs">
+      <DependentUpon>MCPEditDialog.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\AIDiffView.xaml.cs">
+      <DependentUpon>AIDiffView.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\GitSettingsDialog.xaml.cs">
+      <DependentUpon>GitSettingsDialog.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\UsageDashboardView.xaml.cs">
+      <DependentUpon>UsageDashboardView.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\InlineEditPopup.xaml.cs">
+      <DependentUpon>InlineEditPopup.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\QuestWindow.xaml.cs">
+      <DependentUpon>QuestWindow.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\EnvironmentCheckDialog.xaml.cs">
+      <DependentUpon>EnvironmentCheckDialog.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\KeyboardShortcutsDialog.xaml.cs">
+      <DependentUpon>KeyboardShortcutsDialog.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="Views\MaintenanceDialog.xaml.cs">
+      <DependentUpon>MaintenanceDialog.xaml</DependentUpon>
+    </Compile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="AvalonEdit" Version="6.3.1.120" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.8" />
+    <PackageReference Include="Microsoft.Xaml.Behaviors.Wpf" Version="1.1.142" />
+    <PackageReference Include="System.Speech" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>

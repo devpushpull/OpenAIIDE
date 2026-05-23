@@ -1,0 +1,145 @@
+<Window x:Class="AIIDEWPF.Views.EnvironmentCheckDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="🔧 启动诊断" Width="560" Height="480"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        Background="#252526" Foreground="#d4d4d4">
+    <Window.Resources>
+        <Style TargetType="Button">
+            <Setter Property="Height" Value="28"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Padding" Value="10,0"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Margin" Value="0"/>
+        </Style>
+        <Style TargetType="TextBlock" x:Key="SectionTitle">
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Foreground" Value="#e8c050"/>
+            <Setter Property="Margin" Value="0,0,0,6"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- 标题 + 摘要 -->
+        <StackPanel Grid.Row="0" Margin="0,0,0,10">
+            <TextBlock FontSize="16" FontWeight="Bold" Foreground="#e8c050">
+                🔧 启动诊断
+            </TextBlock>
+            <TextBlock x:Name="StatusLabel" FontSize="12" Foreground="#c0c0c0"
+                       TextWrapping="Wrap" Margin="0,6,0,0"/>
+        </StackPanel>
+
+        <!-- 全部通过提示 -->
+        <Border x:Name="AllPassedPanel" Grid.Row="1" Background="#1a3a1a" CornerRadius="4"
+                Padding="12,10" Margin="0,0,0,10" Visibility="Collapsed">
+            <TextBlock FontSize="14" Foreground="#80d080">
+                ✅ 启动诊断通过，所有服务已就绪。
+            </TextBlock>
+        </Border>
+
+        <!-- 网络状态 -->
+        <Border x:Name="NetworkPanel" Grid.Row="2" Background="#2a2a2a" CornerRadius="4"
+                Padding="12,10" Margin="0,0,0,10">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <!-- 网络连通性 -->
+                <StackPanel Grid.Row="0" Orientation="Horizontal">
+                    <TextBlock x:Name="NetworkIcon" Text="🌐" FontSize="14" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="NetworkStatusLabel" FontSize="13" FontWeight="SemiBold"
+                               Foreground="#d4d4d4" VerticalAlignment="Center" Margin="6,0,0,0"/>
+                </StackPanel>
+                <!-- 网络详细诊断（快速模式隐藏） -->
+                <ItemsControl x:Name="NetworkDiagsControl" Grid.Row="1" Margin="22,6,0,0"
+                              Visibility="Collapsed">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <StackPanel Orientation="Horizontal" Margin="0,1">
+                                <TextBlock Text="{Binding StatusIcon}" FontSize="12" VerticalAlignment="Center" Width="24"/>
+                                <TextBlock Text="{Binding Name}" FontSize="11" Foreground="#c0c0c0"
+                                           VerticalAlignment="Center" Width="160" TextTrimming="CharacterEllipsis"/>
+                                <TextBlock Text="{Binding LatencyDisplay}" FontSize="10" Foreground="#888"
+                                           VerticalAlignment="Center" Width="50" TextAlignment="Right"/>
+                                <TextBlock Text="{Binding Detail}" FontSize="10" Foreground="#777"
+                                           VerticalAlignment="Center" Margin="6,0,0,0" TextTrimming="CharacterEllipsis"/>
+                            </StackPanel>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </Grid>
+        </Border>
+
+        <!-- 缺失环境列表 -->
+        <Border Grid.Row="3" Background="#2a2a2a" CornerRadius="4" Padding="12,10">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Style="{StaticResource SectionTitle}"
+                           Text="⚠️ 缺失的运行环境"/>
+                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,6,0,0">
+                    <ItemsControl x:Name="MissingItemsControl">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Border Background="#333" CornerRadius="4" Padding="10,8"
+                                        Margin="0,0,0,6">
+                                    <Grid>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="Auto"/>
+                                            <RowDefinition Height="Auto"/>
+                                        </Grid.RowDefinitions>
+
+                                        <!-- 第一行：名称和状态 -->
+                                        <StackPanel Grid.Row="0" Orientation="Horizontal">
+                                            <TextBlock Text="❌" FontSize="14" VerticalAlignment="Center"/>
+                                            <TextBlock Text="{Binding Name}" FontSize="14" FontWeight="Bold"
+                                                       Foreground="#f0a060" VerticalAlignment="Center" Margin="6,0,0,0"/>
+                                        </StackPanel>
+
+                                        <!-- 第二行：下载地址和操作按钮 -->
+                                        <StackPanel Grid.Row="1" Orientation="Vertical" Margin="22,4,0,0">
+                                            <TextBlock FontSize="11" Foreground="#888"
+                                                       TextWrapping="Wrap" Margin="0,0,0,6">
+                                                <Run Text="下载地址："/>
+                                                <Run Text="{Binding DownloadUrl}" Foreground="#6a9ecf"/>
+                                            </TextBlock>
+                                            <StackPanel Orientation="Horizontal">
+                                                <Button Content="🌐 打开下载页" Background="#3a5a7a"
+                                                        Foreground="#a0d0e0" Width="110"
+                                                        Click="OpenUrl_Click" Tag="{Binding}"/>
+                                                <Button Content="⚡ 一键安装" Background="#3a6a3a"
+                                                        Foreground="#a0d0a0" Width="100" Margin="8,0,0,0"
+                                                        Click="OneClickInstall_Click" Tag="{Binding}"/>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </Grid>
+        </Border>
+
+        <!-- 底部按钮 -->
+        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,14,0,0">
+            <Button x:Name="RecheckBtn" Content="🔄 重新检测" Background="#4a4a3a"
+                    Foreground="#d0d0a0" Width="100" Click="RecheckBtn_Click"/>
+            <Button x:Name="IgnoreBtn" Content="忽略并继续" Background="#4a4a4a"
+                    Foreground="#aaa" Width="110" Margin="8,0,0,0" Click="IgnoreBtn_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

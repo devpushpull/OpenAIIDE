@@ -1,0 +1,1960 @@
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
+using AIIDEWPF.Models;
+
+namespace AIIDEWPF.Services;
+
+public partial class AIService
+{
+    private readonly HttpClient _http;
+    private readonly ConfigService _config;
+    private readonly ModelManager _modelManager;
+    private readonly ChatModeService _chatModeService;
+    private readonly FileService _fileService;
+    private readonly SearchService _searchService;
+    private readonly TerminalService _terminalService;
+    private readonly PromptService _promptService;
+    private readonly FileOperationService _fileOps;
+    private readonly WebSearchService _webSearch;
+    private readonly BuildService _buildService;
+    private BackupService? _backup;
+    private SubAgentService? _subAgent;
+    private HooksService? _hooks;
+    private SandboxService? _sandbox;
+    private readonly List<object> _history = new();
+    private AlgorithmService? _algorithmService;
+    private readonly ConversationCompressor _compressor;
+    private readonly UsageTrackerService _usageTracker;
+    private readonly ModelRouterService _modelRouter;
+    private readonly ModelFailoverService _failover;
+    private SessionManager? _sessionManager;
+    private string _currentSessionId = "default";
+    private int _toolLoopCount;
+    private const int MaxToolLoops = 10;
+    private int _retryCount;
+    private const int MaxRetries = 3;
+    private CancellationTokenSource? _cts;
+    private string? _currentOverrideModel;
+    private string? _currentOverrideProviderId;
+    // 自动构建追踪：本轮是否修改了代码文件 / 是否已调用过 build_project
+    private bool _codeModifiedInRound;
+    private bool _buildCalledInRound;
+    private string? _checkpointId; // 当前批量变更的 checkpoint ID
+
+    public event Action<string>? OnChunk;
+    public event Action<ToolCall>? OnToolCall;
+    public event Action<string, string>? OnDone; // type, content
+    public event Action<string>? OnError;
+    public event Action<string>? OnFileChanged; // file path – 通知 UI 刷新文件树/打开文件
+    public event Action<List<(string content, string status)>>? OnTodoWrite; // 待办列表更新
+    public event Action<string>? OnReasoningChunk; // 推理过程内容
+    public event Func<string, string, Task<bool>>? OnPendingFileChange; // 文件变更确认: toolName, filePath -> 返回 true 接受 / false 拒绝
+    public event Func<string, Task<(bool accepted, bool rememberChoice, bool alwaysAllow)>>? OnTerminalCommandConfirm; // 终端命令确认: command -> (accepted, rememberChoice, alwaysAllow)
+    public event Action<string, string, int>? OnTerminalOutput; // 终端输出: command, output, exitCode
+    /// <summary>联网搜索同意回调: (query, toolName) -> (accepted, rememberChoice)</summary>
+    public event Func<string, string, Task<(bool accepted, bool rememberChoice)>>? OnWebSearchConsent;
+
+    /// <summary>允许AI修改项目外文件时的确认回调: () -> 用户同意返回true</summary>
+    public Func<Task<bool>>? OnAllowExternalEditRequested;
+
+    /// <summary>对话压缩后获取待办状态回调: () -> todo列表</summary>
+    public Func<List<(string content, string status)>>? GetTodosForCompression { get; set; }
+
+    /// <summary>会话切换事件 (oldSessionId, newSessionId)</summary>
+    public event Action<string, string>? OnSessionSwitched;
+
+    /// <summary>Token 用量追踪器（供 ViewModel 绑定 UI）</summary>
+    public UsageTrackerService UsageTracker => _usageTracker;
+
+    /// <summary>当前会话ID（用于文件锁管理）</summary>
+    public string CurrentSessionId
+    {
+        get => _currentSessionId;
+        set => SwitchSession(value);
+    }
+
+    /// <summary>会话调度管理器（可选，启用后文件写操作会加锁防冲突）</summary>
+    public SessionManager? SessionMgr => _sessionManager;
+
+    /// <summary>设置会话管理器，启用文件锁防冲突功能</summary>
+    public void SetSessionManager(SessionManager sm)
+    {
+        _sessionManager = sm;
+        // 自动创建默认会话
+        if (_sessionManager.Sessions.Count == 0)
+        {
+            var session = _sessionManager.CreateSession("默认对话");
+            SwitchSession(session.Id);
+        }
+        else if (_sessionManager.ActiveSession != null)
+        {
+            SwitchSession(_sessionManager.ActiveSession.Id);
+        }
+    }
+
+    public AIService(ConfigService config, ModelManager modelManager, ChatModeService chatModeService, FileService fileService, SearchService searchService, TerminalService terminalService, PromptService promptService, WebSearchService? webSearch = null, NetworkService? networkService = null)
+    {
+        _http = new HttpClient(new SocketsHttpHandler
+        {
+            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+            PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2),
+            MaxConnectionsPerServer = 10,
+            EnableMultipleHttp2Connections = true,
+            ConnectTimeout = TimeSpan.FromSeconds(15)
+        })
+        {
+            Timeout = TimeSpan.FromMinutes(5)
+        };
+        _config = config;
+        _modelManager = modelManager;
+        _chatModeService = chatModeService;
+        _fileService = fileService;
+        _searchService = searchService;
+        _terminalService = terminalService;
+        _promptService = promptService;
+        _fileOps = new FileOperationService();
+        _webSearch = webSearch ?? new WebSearchService(_http);
+        _buildService = new BuildService();
+        _fileOps.OnFileChanged += (fp) => OnFileChanged?.Invoke(fp);
+        _compressor = new ConversationCompressor();
+        _compressor.OnCompressed += (oldCount, newCount, beforeTokens, afterTokens) =>
+        {
+            var savedPercent = beforeTokens > 0 ? (int)((1 - (double)afterTokens / beforeTokens) * 100) : 0;
+            OnChunk?.Invoke($"\n[📦 对话已压缩: {oldCount}条 → {newCount}条 | tokens: {beforeTokens:N0} → {afterTokens:N0} (节省 {savedPercent}%)]\n");
+        };
+        _usageTracker = new UsageTrackerService();
+        _modelRouter = new ModelRouterService(_modelManager);
+        _failover = new ModelFailoverService(_modelManager, networkService ?? new NetworkService());
+        _failover.OnFailover += (oldModel, newModel, reason) =>
+        {
+            OnChunk?.Invoke($"\n[🔄 模型自动切换: {oldModel} → {newModel}]\n[📋 原因: {reason}]\n");
+        };
+    }
+
+    /// <summary>设置钩子服务，启用工具调用前后的自定义脚本</summary>
+    public void SetHooksService(HooksService hooks) => _hooks = hooks;
+
+    /// <summary>设置沙箱安全服务</summary>
+    public void SetSandboxService(SandboxService sandbox) => _sandbox = sandbox;
+
+    /// <summary>公开文件操作服务，供 UI 侧调用</summary>
+    public FileOperationService FileOps => _fileOps;
+    private string _projectPath => _fileOps.ProjectPath;
+
+    /// <summary>当前批量变更的 checkpoint ID（null 表示无活跃 checkpoint）</summary>
+    public string? CurrentCheckpointId => _checkpointId;
+
+    public bool AllowExternalFileEdit
+    {
+        get => _fileOps.AllowExternalEdit;
+        set
+        {
+            // 当从 false 切换到 true 时，如果有确认回调则请求用户确认
+            if (value && !_fileOps.AllowExternalEdit && OnAllowExternalEditRequested != null)
+            {
+                var accepted = OnAllowExternalEditRequested.Invoke().GetAwaiter().GetResult();
+                if (!accepted) return; // 用户拒绝，不修改值
+            }
+            _fileOps.AllowExternalEdit = value;
+        }
+    }
+
+    public void SetProjectPath(string path)
+    {
+        _fileOps.SetProjectPath(path);
+        _algorithmService = new AlgorithmService(path);
+        _buildService.SetProjectPath(path);
+
+        // 初始化子代理服务
+        var apiKey = _modelManager.GetEffectiveApiKey(_modelManager.ActiveProvider?.Id ?? "");
+        if (!string.IsNullOrEmpty(apiKey))
+        {
+            var baseUrl = _modelManager.ActiveProvider?.BaseUrl ?? "https://api.deepseek.com/v1";
+            var model = _modelManager.ActiveModel?.Id ?? "deepseek-v4-pro";
+            _subAgent = new SubAgentService(apiKey, baseUrl, model);
+            _subAgent.OnAgentResult += (type, summary) =>
+                OnChunk?.Invoke($"\n[🤖 {type} 子代理完成: {summary}]\n");
+        }
+    }
+
+    /// <summary>公开编译服务，供 UI 侧调用</summary>
+    public BuildService BuildSvc => _buildService;
+
+    /// <summary>获取当前项目的算法列表（供 UI 展示）</summary>
+    public IReadOnlyList<Models.AlgorithmInfo> GetAlgorithms() =>
+        _algorithmService?.All ?? Array.Empty<Models.AlgorithmInfo>().AsReadOnly();
+
+    public List<object> GetHistory() => new(_history);
+    public void ClearHistory() => _history.Clear();
+
+    /// <summary>保存当前会话的对话历史到 ConversationSession.History</summary>
+    public void SaveCurrentSessionHistory()
+    {
+        if (_sessionManager == null) return;
+        var session = _sessionManager.FindSession(_currentSessionId);
+        if (session == null) return;
+        lock (session.History)
+        {
+            session.History.Clear();
+            session.History.AddRange(_history);
+        }
+        LogService.Instance.Debug($"会话历史已保存: {session.Name} ({session.Id}), {_history.Count}条", "Session");
+    }
+
+    /// <summary>从 ConversationSession.History 加载对话历史</summary>
+    public void LoadSessionHistory(string sessionId)
+    {
+        if (_sessionManager == null) return;
+        var session = _sessionManager.FindSession(sessionId);
+        if (session == null) return;
+        lock (session.History)
+        {
+            _history.Clear();
+            if (session.History.Count > 0)
+                _history.AddRange(session.History);
+        }
+        LogService.Instance.Debug($"会话历史已加载: {session.Name} ({session.Id}), {_history.Count}条", "Session");
+    }
+
+    /// <summary>切换到指定会话，保存当前历史并加载目标会话历史</summary>
+    public void SwitchSession(string newSessionId)
+    {
+        if (newSessionId == _currentSessionId) return;
+
+        var oldSessionId = _currentSessionId;
+
+        // 1. 保存当前会话历史
+        SaveCurrentSessionHistory();
+
+        // 2. 切换 sessionId
+        _currentSessionId = newSessionId;
+
+        // 3. 加载新会话历史
+        LoadSessionHistory(newSessionId);
+
+        // 4. 通知外部
+        OnSessionSwitched?.Invoke(oldSessionId, newSessionId);
+        LogService.Instance.Info($"会话已切换: {oldSessionId} → {newSessionId}, 历史={_history.Count}条", "Session");
+    }
+
+    /// <summary>LLM 智能压缩对话历史（供 UI 手动触发）</summary>
+    public async Task<string?> CompressHistoryWithLLMAsync()
+    {
+        return await _compressor.CompressWithLLMAsync(_history);
+    }
+
+    /// <summary>注入当前待办列表上下文，确保压缩后 AI 仍知晓任务状态</summary>
+    public void InjectTodoContext(List<(string content, string status)> todos)
+    {
+        if (todos.Count == 0) return;
+
+        var pending = todos.Where(t => t.status == "pending").ToList();
+        var inProgress = todos.Where(t => t.status == "in_progress").ToList();
+        var completed = todos.Where(t => t.status == "completed").ToList();
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine("[当前任务状态 — 请继续执行未完成的任务]");
+
+        if (pending.Count > 0)
+        {
+            sb.AppendLine($"\n⏳ 待办 ({pending.Count}):");
+            foreach (var t in pending)
+                sb.AppendLine($"  - {t.content}");
+        }
+        if (inProgress.Count > 0)
+        {
+            sb.AppendLine($"\n🔄 进行中 ({inProgress.Count}):");
+            foreach (var t in inProgress)
+                sb.AppendLine($"  - {t.content}");
+        }
+        if (completed.Count > 0)
+        {
+            sb.AppendLine($"\n✅ 已完成 ({completed.Count}):");
+            foreach (var t in completed.TakeLast(3))
+                sb.AppendLine($"  - {t.content}");
+        }
+
+        sb.AppendLine("\n请基于以上状态继续工作，优先处理待办和进行中的任务。");
+        _history.Add(new { role = "system", content = sb.ToString() });
+    }
+
+    /// <summary>保存对话历史到项目 .aiide 目录</summary>
+    public void SaveHistory()
+    {
+        if (string.IsNullOrEmpty(_projectPath) || _history.Count == 0) return;
+        try
+        {
+            var aiideDir = Path.Combine(_projectPath, ".aiide");
+            Directory.CreateDirectory(aiideDir);
+            var historyPath = Path.Combine(aiideDir, "chat_history.json");
+            var json = JsonSerializer.Serialize(_history, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(historyPath, json);
+            LogService.Instance.Info($"对话历史已保存 ({_history.Count} 条)", "AI");
+        }
+        catch (Exception ex)
+        {
+            LogService.Instance.Warn($"保存对话历史失败: {ex.Message}", "AI");
+        }
+    }
+
+    /// <summary>从项目 .aiide 目录恢复对话历史</summary>
+    /// <returns>恢复的条目数</returns>
+    public int RestoreHistory()
+    {
+        if (string.IsNullOrEmpty(_projectPath)) return 0;
+        try
+        {
+            var historyPath = Path.Combine(_projectPath, ".aiide", "chat_history.json");
+            if (!File.Exists(historyPath)) return 0;
+
+            var json = File.ReadAllText(historyPath);
+            var entries = JsonSerializer.Deserialize<List<JsonElement>>(json);
+            if (entries == null || entries.Count == 0) return 0;
+
+            // 清理超过30天的历史
+            var fileAge = DateTime.UtcNow - File.GetLastWriteTimeUtc(historyPath);
+            if (fileAge.TotalDays > 30)
+            {
+                File.Delete(historyPath);
+                LogService.Instance.Info("对话历史已过期(>30天)，已清除", "AI");
+                return 0;
+            }
+
+            _history.Clear();
+            foreach (var entry in entries)
+            {
+                // 将 JsonElement 转换为匿名对象
+                var dict = new Dictionary<string, object?>();
+                foreach (var prop in entry.EnumerateObject())
+                {
+                    if (prop.Value.ValueKind == JsonValueKind.String)
+                        dict[prop.Name] = prop.Value.GetString();
+                    else if (prop.Value.ValueKind == JsonValueKind.Array)
+                        dict[prop.Name] = prop.Value.EnumerateArray().Select(e => (object)e.ToString()).ToList();
+                    else
+                        dict[prop.Name] = prop.Value.GetRawText();
+                }
+                _history.Add(dict);
+            }
+            LogService.Instance.Info($"对话历史已恢复 ({_history.Count} 条)", "AI");
+            return _history.Count;
+        }
+        catch (Exception ex)
+        {
+            LogService.Instance.Warn($"恢复对话历史失败: {ex.Message}", "AI");
+            return 0;
+        }
+    }
+
+    public async Task SendStreamMessageAsync(string message, string? context = null, string? overrideModel = null, string? overrideProviderId = null)
+    {
+        _toolLoopCount = 0;
+        _codeModifiedInRound = false;
+        _buildCalledInRound = false;
+        _currentOverrideModel = overrideModel;
+        _currentOverrideProviderId = overrideProviderId;
+
+        // 会话状态：开始推理
+        _sessionManager?.SetSessionStatus(_currentSessionId, SessionStatus.Running);
+
+        string activeModel;
+        string activeProviderId;
+        string? routeInfo = null;
+
+        // 智能调度：如果用户未手动指定模型，根据任务难度自动路由
+        if (string.IsNullOrEmpty(overrideModel) && string.IsNullOrEmpty(overrideProviderId))
+        {
+            var route = _modelRouter.Route(message, _modelManager.ActiveProvider?.Id, _modelManager.ActiveModel?.Id);
+            activeModel = route.ModelId;
+            activeProviderId = route.ProviderId;
+
+            // 如果路由结果与当前激活模型不同，记录信息
+            if (route.ModelId != (_modelManager.ActiveModel?.Id ?? ""))
+            {
+                routeInfo = $"🎯 智能调度: {route.ModelName} | {route.Reason}";
+                OnChunk?.Invoke($"\n[{routeInfo}]\n");
+                // 临时设置override以便后续使用
+                _currentOverrideModel = activeModel;
+                _currentOverrideProviderId = activeProviderId;
+            }
+        }
+        else
+        {
+            activeModel = overrideModel ?? _modelManager.ActiveModel?.Id ?? "deepseek-v4-pro";
+            activeProviderId = overrideProviderId ?? _modelManager.ActiveProvider?.Id ?? "";
+        }
+
+        LogService.Instance.Info($"发送消息: [{Truncate(message, 80)}], 历史={_history.Count}条, 模型={activeModel}, 模式={_chatModeService.ActiveModeId}", "AI");
+        var apiKey = _modelManager.GetEffectiveApiKey(activeProviderId);
+        if (string.IsNullOrEmpty(apiKey))
+        {
+            LogService.Instance.Warn("API Key 未配置", "AI");
+            OnError?.Invoke("请在设置中配置 API Key");
+            return;
+        }
+
+        var systemPrompt = GetSystemPrompt();
+        if (!string.IsNullOrEmpty(context))
+            systemPrompt += $"\n\n<context>\n{Truncate(context, 5000)}\n</context>";
+
+        // 自动上下文注入：从用户消息中检测文件名/类名，自动读取并注入
+        var autoContext = await BuildAutoContextAsync(message, systemPrompt);
+        if (!string.IsNullOrEmpty(autoContext))
+            systemPrompt += $"\n\n<auto_context>\n{autoContext}\n</auto_context>";
+
+        if (_chatModeService.IsQAMode)
+            systemPrompt += "\n\n【当前模式：问答模式】你只能阅读/搜索项目代码来回答问题，不能修改、创建、删除任何文件或运行终端命令。请扫描项目并在回答中展示理解，但不要做任何修改。";
+
+        // 任务复杂度检测：复杂任务自动注入规划提醒
+        if (DetectComplexTask(message) && !_chatModeService.IsQAMode)
+        {
+            systemPrompt += "\n\n" +
+                "【规划提醒】这是一个复杂任务。建议你先：\n" +
+                "1. 使用 todo_write 创建结构化任务列表\n" +
+                "2. 先用 read_file / scan_project 了解相关代码\n" +
+                "3. 按步骤执行，每完成一步更新 todo 状态\n" +
+                "4. 完成后提供总结（修改的文件、关键变更、验证建议）";
+            LogService.Instance.Info($"检测到复杂任务，已注入规划提醒", "AI");
+        }
+
+        // 会话压缩检查
+        var wasCompressed = _compressor.TryCompress(_history);
+
+        // 压缩后注入当前待办状态，确保 AI 继续执行未完成任务
+        if (wasCompressed && GetTodosForCompression != null)
+        {
+            var todos = GetTodosForCompression();
+            if (todos.Count > 0)
+                InjectTodoContext(todos);
+        }
+
+        var messages = new List<object> { new { role = "system", content = systemPrompt } };
+        messages.AddRange(_history.TakeLast(20));
+        messages.Add(new { role = "user", content = message });
+
+        try
+        {
+            var result = await StreamChatCompletionAsync(messages, apiKey, overrideModel, overrideProviderId);
+            var fullContent = result.Content;
+            var reasoningContent = result.ReasoningContent;
+            var toolCalls = result.ToolCalls;
+
+            _history.Add(new { role = "user", content = message });
+
+            if (toolCalls.Count > 0)
+            {
+                LogService.Instance.Info($"收到 {toolCalls.Count} 个工具调用", "AI");
+                _history.Add(MsgAssistant(null, toolCalls, reasoningContent));
+                StartBatchCheckpoint(toolCalls);
+
+                // ===== 大批量写操作自动拆分：超过5个写操作时只处理前5个，其余排队 =====
+                var writeToolCalls = toolCalls
+                    .Where(tc => tc.Name is "search_replace" or "create_file" or "delete_file"
+                        or "rename_file" or "move_file" or "copy_file")
+                    .ToList();
+                var readToolCalls = toolCalls
+                    .Where(tc => !writeToolCalls.Contains(tc))
+                    .ToList();
+
+                const int maxWriteBatchSize = 5;
+                if (writeToolCalls.Count > maxWriteBatchSize)
+                {
+                    var deferredWrites = writeToolCalls.Skip(maxWriteBatchSize).ToList();
+                    var activeWrites = writeToolCalls.Take(maxWriteBatchSize).ToList();
+                    var activeBatch = new List<ToolCall>();
+                    activeBatch.AddRange(activeWrites);
+                    activeBatch.AddRange(readToolCalls);
+
+                    var warningMsg = $"⚠️ 检测到 {writeToolCalls.Count} 个文件写操作（超过安全阈值 {maxWriteBatchSize}），" +
+                        $"已自动拆分为 {Math.Ceiling(writeToolCalls.Count / (double)maxWriteBatchSize)} 批执行。\n" +
+                        $"本批处理: {string.Join(", ", activeWrites.Select(t => t.Name + " → " + ExtractArgPath(t)))}。";
+                    OnChunk?.Invoke($"\n{warningMsg}\n");
+                    LogService.Instance.Warn($"大批量写操作自动拆分: {writeToolCalls.Count} → 分批", "AI");
+
+                    // 只执行当前批（前5个写操作 + 所有读操作）
+                    foreach (var tc in activeBatch)
+                    {
+                        await ExecuteAndLogToolAsync(tc);
+                    }
+
+                    // 将剩余工具调用注入为后续系统消息
+                    var deferredNames = string.Join(", ", deferredWrites.Select(t => $"{t.Name} → {ExtractArgPath(t)}"));
+                    _history.Add(new
+                    {
+                        role = "system",
+                        content = $"⚠️ 上一批修改已完成（进度: {activeWrites.Count}/{writeToolCalls.Count}）。" +
+                            $"剩余待处理的文件修改 ({deferredWrites.Count} 个): {deferredNames}。" +
+                            $"请继续处理剩余文件，每批不超过 {maxWriteBatchSize} 个文件。"
+                    });
+                }
+                else
+                {
+                    foreach (var tc in toolCalls)
+                    {
+                        await ExecuteAndLogToolAsync(tc);
+                    }
+                }
+
+                FinishBatchCheckpoint();
+                OnDone?.Invoke("tool_continue", toolCalls.Count.ToString());
+            }
+            else
+            {
+                _history.Add(MsgAssistant(fullContent, reasoningContent: reasoningContent));
+                LogService.Instance.Info($"AI回复完成: [{Truncate(fullContent, 80)}]", "AI");
+
+                // 检测并矫正中英文混合回答
+                if (DetectLanguageMixing(fullContent, out var mixedRatio))
+                {
+                    LogService.Instance.Warn($"检测到中英文混合回答 (混合度: {mixedRatio:P1})，注入语言矫正提示", "AI");
+                    var lang = _promptService.ResponseLanguage;
+                    var correction = $"[系统提示] 你的上一段回复中出现了中英文混合的情况（混合度约 {mixedRatio:P0}），" +
+                        $"请严格使用 {lang} 回答，不要中英文混杂。代码部分可以用英文，但解释说明必须统一用 {lang}。";
+                    _history.Add(new { role = "system", content = correction });
+                    OnChunk?.Invoke($"\n[⚠️ 检测到中英文混合，已引导模型使用 {lang} 回答]\n");
+                }
+
+                OnDone?.Invoke("done", fullContent);
+                _sessionManager?.SetSessionStatus(_currentSessionId, SessionStatus.Idle);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            OnChunk?.Invoke("\n[已停止]\n");
+            // 用户主动取消时保留 checkpoint 以便后续恢复
+            if (_checkpointId != null)
+                OnChunk?.Invoke($"\n[💾 变更已保存到 checkpoint: {_checkpointId}，重启后可恢复]\n");
+            OnDone?.Invoke("done", "");
+            _sessionManager?.SetSessionStatus(_currentSessionId, SessionStatus.Idle);
+        }
+        catch (Exception ex)
+        {
+            LogService.Instance.Error(ex, "AI");
+
+            // === 故障自动切换：记录错误并尝试切换到备用模型 ===
+            _failover.RecordError(activeModel, ex.Message);
+            var fallback = _failover.GetFallbackModel(activeModel, activeProviderId);
+
+            if (fallback.HasValue)
+            {
+                var (fbProviderId, fbModel) = fallback.Value;
+                OnChunk?.Invoke($"\n[🔄 模型自动切换: {activeModel} → {fbModel.Name}]\n[📋 原因: {activeModel} 调用异常，自动切换至备用模型]\n");
+                LogService.Instance.Info($"Failover: {activeModel} → {fbModel.Id} (provider: {fbProviderId}), 原因: {ex.Message}", "Failover");
+
+                try
+                {
+                    var fbApiKey = _modelManager.GetEffectiveApiKey(fbProviderId);
+                    if (!string.IsNullOrEmpty(fbApiKey))
+                    {
+                        var fbMessages = new List<object> { new { role = "system", content = GetSystemPrompt() } };
+                        fbMessages.AddRange(_history.TakeLast(20));
+                        fbMessages.Add(new { role = "user", content = message });
+
+                        var fbResult = await StreamChatCompletionAsync(fbMessages, fbApiKey, fbModel.Id, fbProviderId);
+                        var fbFullContent = fbResult.Content;
+                        var fbReasoningContent = fbResult.ReasoningContent;
+                        var fbToolCalls = fbResult.ToolCalls;
+
+                        OnChunk?.Invoke(fbFullContent);
+                        _history.Add(new { role = "user", content = message });
+
+                        if (fbToolCalls.Count > 0)
+                        {
+                            _history.Add(MsgAssistant(null, fbToolCalls, fbReasoningContent));
+                            StartBatchCheckpoint(fbToolCalls);
+                            foreach (var tc in fbToolCalls)
+                                await ExecuteAndLogToolAsync(tc);
+                            FinishBatchCheckpoint();
+                            OnDone?.Invoke("tool_continue", fbToolCalls.Count.ToString());
+                            _sessionManager?.SetSessionStatus(_currentSessionId, SessionStatus.Idle);
+                            return;
+                        }
+
+                        if (!string.IsNullOrEmpty(fbFullContent))
+                            _history.Add(MsgAssistant(fbFullContent, null, fbReasoningContent));
+
+                        // 检测并矫正中英文混合回答
+                        if (DetectLanguageMixing(fbFullContent, out var fbMixedRatio))
+                        {
+                            var lang = _promptService.ResponseLanguage;
+                            var correction = $"[系统提示] 你的上一段回复中出现了中英文混合的情况（混合度约 {fbMixedRatio:P0}），" +
+                                $"请严格使用 {lang} 回答，不要中英文混杂。代码部分可以用英文，但解释说明必须统一用 {lang}。";
+                            _history.Add(new { role = "system", content = correction });
+                        }
+                        OnDone?.Invoke("done", fbFullContent);
+                        _sessionManager?.SetSessionStatus(_currentSessionId, SessionStatus.Idle);
+                        return;
+                    }
+                }
+                catch (Exception fbEx)
+                {
+                    LogService.Instance.Error($"Failover 重试也失败: {fbEx.Message}", "Failover");
+                    _failover.RecordError(fbModel.Id, fbEx.Message);
+                    OnChunk?.Invoke($"\n[⚠️ 备用模型 {fbModel.Name} 也调用失败: {fbEx.Message}]\n");
+                }
+            }
+            else
+            {
+                OnChunk?.Invoke("\n[⚠️ 无可用的备用模型，请检查模型配置和网络连接]\n");
+            }
+
+            // 崩溃时保留 checkpoint，提示用户可恢复
+            var recoveryHint = _checkpointId != null
+                ? $"\n💡 代码修改前已创建 checkpoint ({_checkpointId})，重启后可从聊天区恢复文件。\n"
+                : "";
+            OnError?.Invoke(ex.Message + recoveryHint);
+            _sessionManager?.SetSessionStatus(_currentSessionId, SessionStatus.Error);
+        }
+    }
+
+    public async Task ContinueWithToolResultsAsync()
+    {
+        _toolLoopCount++;
+        if (_toolLoopCount > MaxToolLoops)
+        {
+            OnDone?.Invoke("done", "[已达到最大工具调用轮次，执行结束。]");
+            _sessionManager?.SetSessionStatus(_currentSessionId, SessionStatus.Idle);
+            return;
+        }
+
+        var apiKey = _modelManager.GetEffectiveApiKey(_modelManager.ActiveProvider?.Id ?? "");
+        if (string.IsNullOrEmpty(apiKey)) return;
+
+        var messages = new List<object> { new { role = "system", content = GetSystemPrompt() } };
+        messages.AddRange(_history.TakeLast(30));
+
+        try
+        {
+            var result = await StreamChatCompletionAsync(messages, apiKey, _currentOverrideModel, _currentOverrideProviderId);
+            var fullContent = result.Content;
+            var reasoningContent = result.ReasoningContent;
+            var toolCalls = result.ToolCalls;
+
+            if (toolCalls.Count > 0)
+            {
+                _history.Add(MsgAssistant(null, toolCalls, reasoningContent));
+                StartBatchCheckpoint(toolCalls);
+
+                // ===== 大批量写操作自动拆分 =====
+                var writeToolCalls = toolCalls
+                    .Where(tc => tc.Name is "search_replace" or "create_file" or "delete_file"
+                        or "rename_file" or "move_file" or "copy_file")
+                    .ToList();
+                var readToolCalls = toolCalls
+                    .Where(tc => !writeToolCalls.Contains(tc))
+                    .ToList();
+
+                const int maxWriteBatchSize = 5;
+                if (writeToolCalls.Count > maxWriteBatchSize)
+                {
+                    var deferredWrites = writeToolCalls.Skip(maxWriteBatchSize).ToList();
+                    var activeWrites = writeToolCalls.Take(maxWriteBatchSize).ToList();
+                    var activeBatch = new List<ToolCall>();
+                    activeBatch.AddRange(activeWrites);
+                    activeBatch.AddRange(readToolCalls);
+
+                    OnChunk?.Invoke($"\n⚠️ 自动拆分: {writeToolCalls.Count} 个写操作 → 分批执行\n");
+                    foreach (var tc in activeBatch)
+                        await ExecuteAndLogToolAsync(tc);
+
+                    var deferredNames = string.Join(", ", deferredWrites.Select(t => $"{t.Name} → {ExtractArgPath(t)}"));
+                    _history.Add(new
+                    {
+                        role = "system",
+                        content = $"剩余待处理的文件修改 ({deferredWrites.Count} 个): {deferredNames}。请继续处理。"
+                    });
+                }
+                else
+                {
+                    foreach (var tc in toolCalls)
+                        await ExecuteAndLogToolAsync(tc);
+                }
+
+                FinishBatchCheckpoint();
+                OnDone?.Invoke("tool_continue", toolCalls.Count.ToString());
+            }
+            else
+            {
+                _history.Add(MsgAssistant(fullContent, reasoningContent: reasoningContent));
+
+                // 自动构建验证：代码修改后未调用 build_project 时，自动注入
+                if (ShouldAutoBuild())
+                {
+                    OnChunk?.Invoke("\n[自动构建验证...]\n");
+                    var buildResult = await BuildProjectTool(JsonNode.Parse("{\"action\":\"build\"}"));
+                    _buildCalledInRound = true;
+
+                    // 将构建结果注入为用户消息，强制大模型分析结果并做出响应
+                    var buildMsg = JsonSerializer.Deserialize<JsonElement>(buildResult);
+                    var buildSuccess = buildMsg.TryGetProperty("success", out var s) && s.GetBoolean();
+                    var buildOutput = buildMsg.TryGetProperty("output", out var o) ? o.GetString() ?? "" : "";
+                    var buildError = buildMsg.TryGetProperty("stderr", out var e) ? e.GetString() ?? "" : "";
+
+                    if (buildSuccess)
+                    {
+                        _history.Add(new { role = "user", content = $"[自动构建结果] 编译通过。请确认代码修改正确，并简要总结本次完成的工作。\n{Truncate(buildOutput, 2000)}" });
+                        OnChunk?.Invoke("\n[自动构建: 编译通过]\n");
+                    }
+                    else
+                    {
+                        var errMsg = !string.IsNullOrEmpty(buildError) ? buildError : buildOutput;
+                        _history.Add(new { role = "user", content = $"[自动构建结果] 编译失败！请分析以下错误信息，定位问题文件并修复代码。修复后请重新调用 build_project(action='build') 验证。\n错误详情:\n{Truncate(errMsg, 3000)}" });
+                        OnChunk?.Invoke("\n[自动构建: 编译失败，正在分析错误...]\n");
+                    }
+
+                    // 将构建结果传递给 AI 继续处理（让大模型分析构建输出并做出响应）
+                    OnDone?.Invoke("tool_continue", "1");
+                    return;
+                }
+
+                OnDone?.Invoke("done", fullContent);
+                _sessionManager?.SetSessionStatus(_currentSessionId, SessionStatus.Idle);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            OnChunk?.Invoke("\n[已停止]\n");
+            // 用户主动取消时保留 checkpoint 以便后续恢复
+            if (_checkpointId != null)
+                OnChunk?.Invoke($"\n[💾 变更已保存到 checkpoint: {_checkpointId}，重启后可恢复]\n");
+            OnDone?.Invoke("done", "");
+            _sessionManager?.SetSessionStatus(_currentSessionId, SessionStatus.Idle);
+        }
+        catch (Exception ex)
+        {
+            LogService.Instance.Error(ex, "AI");
+            // 崩溃时保留 checkpoint，提示用户可恢复
+            var recoveryHint = _checkpointId != null
+                ? $"\n💡 代码修改前已创建 checkpoint ({_checkpointId})，重启后可从聊天区恢复文件。\n"
+                : "";
+            OnError?.Invoke(ex.Message + recoveryHint);
+            _sessionManager?.SetSessionStatus(_currentSessionId, SessionStatus.Error);
+        }
+    }
+
+    private async Task<(string Content, string ReasoningContent, List<ToolCall> ToolCalls)> StreamChatCompletionAsync(
+        List<object> messages, string apiKey, string? overrideModel = null, string? overrideProviderId = null)
+    {
+        _retryCount = 0;
+        _cts?.Dispose();
+        _cts = new CancellationTokenSource();
+        var ct = _cts.Token;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        var provider = !string.IsNullOrEmpty(overrideProviderId)
+            ? _modelManager.GetProviders().FirstOrDefault(p => p.Id == overrideProviderId)
+            : _modelManager.ActiveProvider;
+        var baseUrl = provider?.BaseUrl ?? "https://api.deepseek.com/v1";
+        var model = overrideModel ?? _modelManager.ActiveModel?.Id ?? "deepseek-v4-pro";
+
+        var reqDict = new Dictionary<string, object>
+        {
+            ["model"] = model,
+            ["messages"] = messages,
+            ["temperature"] = GetDynamicTemperature(messages),
+            ["stream"] = true,
+            ["tools"] = GetToolsForMode(),
+            ["tool_choice"] = "auto"
+        };
+        var maxTokens = _config.GetAIConfig().MaxTokens;
+        if (maxTokens > 0) reqDict["max_tokens"] = maxTokens;
+        var json = JsonSerializer.Serialize(reqDict);
+        LogService.Instance.Info($"API请求: provider={provider?.Id}, model={model}, msgs={messages.Count}, json长度={json.Length}", "API");
+        var content = new StringContent(json, Encoding.UTF8, "application/json");
+        var request = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/chat/completions")
+        {
+            Content = content
+        };
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+
+        // 预检：快速检查API可达性（非阻塞，超时3秒）
+        var isReachable = await _failover.PingApiAsync(baseUrl, apiKey, ct);
+        if (!isReachable)
+        {
+            LogService.Instance.Warn($"API预检失败: {baseUrl} 不可达", "API");
+            // 不直接失败，让主请求自行重试（预检可能误判）
+        }
+
+        var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+        LogService.Instance.Info($"API响应: {(int)response.StatusCode} {response.StatusCode}", "API");
+
+        // === 解析速率限制头 ===
+        _usageTracker.ParseRateLimitHeaders(h =>
+        {
+            if (response.Headers.TryGetValues(h, out var vals)) return vals.FirstOrDefault();
+            return null;
+        });
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var errBody = await response.Content.ReadAsStringAsync();
+            LogService.Instance.Error($"API {response.StatusCode}: {Truncate(errBody, 1000)}\n请求体: {Truncate(json, 2000)}", "API");
+            _failover.RecordError(model, $"HTTP {(int)response.StatusCode}: {Truncate(errBody, 200)}");
+
+            // === 检测配额/速率限制错误 ===
+            var quotaMsg = _usageTracker.DetectQuotaExceeded(errBody, (int)response.StatusCode);
+            if (quotaMsg != null)
+                OnError?.Invoke(quotaMsg);
+
+            // === 指数退避自动重试 (429/5xx) ===
+            int statusCode = (int)response.StatusCode;
+            if ((statusCode == 429 || statusCode >= 500) && _retryCount < MaxRetries)
+            {
+                _retryCount++;
+                int delaySecs = GetRetryDelay(statusCode, response);
+                OnError?.Invoke($"🔄 API {(System.Net.HttpStatusCode)statusCode}，{delaySecs}s 后自动重试 ({_retryCount}/{MaxRetries})...");
+                await Task.Delay(delaySecs * 1000, ct);
+                return await StreamChatCompletionAsync(messages, apiKey, overrideModel, overrideProviderId);
+            }
+        }
+        response.EnsureSuccessStatusCode();
+
+        var stream = await response.Content.ReadAsStreamAsync();
+        using var reader = new StreamReader(stream);
+        var fullContent = "";
+        var reasoningContent = "";
+        var toolCalls = new Dictionary<int, ToolCall>();
+
+        string? line;
+        while ((line = await reader.ReadLineAsync()) != null)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (string.IsNullOrEmpty(line) || !line.StartsWith("data: ")) continue;
+
+            var data = line["data: ".Length..].Trim();
+            if (data == "[DONE]") break;
+
+            try
+            {
+                var j = JsonNode.Parse(data);
+                var delta = j?["choices"]?[0]?["delta"];
+                if (delta == null) continue;
+
+                var reasoningDelta = delta["reasoning_content"]?.GetValue<string>();
+                if (reasoningDelta != null)
+                {
+                    reasoningContent += reasoningDelta;
+                    OnReasoningChunk?.Invoke(reasoningDelta);
+                }
+
+                var contentDelta = delta["content"]?.GetValue<string>();
+                if (!string.IsNullOrEmpty(contentDelta))
+                {
+                    fullContent += contentDelta;
+                    OnChunk?.Invoke(contentDelta);
+                }
+
+                var tcArray = delta["tool_calls"]?.AsArray();
+                if (tcArray != null)
+                {
+                    foreach (var tc in tcArray)
+                    {
+                        var idx = tc?["index"]?.GetValue<int>() ?? 0;
+                        if (!toolCalls.ContainsKey(idx))
+                            toolCalls[idx] = new ToolCall { Id = tc?["id"]?.GetValue<string>() ?? "" };
+
+                        var tcObj = toolCalls[idx];
+                        if (tc?["id"] != null) tcObj.Id = tc["id"]!.GetValue<string>();
+                        var fn = tc?["function"];
+                        if (fn?["name"] != null) tcObj.Name = fn["name"]!.GetValue<string>();
+                        if (fn?["arguments"] != null) tcObj.Arguments += fn["arguments"]!.GetValue<string>();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogService.Instance.Debug($"流式解析跳过异常行: {ex.Message}", "AI");
+            }
+        }
+
+        // === 记录 Token 用量 ===
+        sw.Stop();
+        _usageTracker.RecordUsage(json, fullContent + reasoningContent,
+            modelName: model, responseTimeMs: sw.ElapsedMilliseconds);
+
+        // === 异步拉取平台用量（不阻塞主流程）===
+        _ = _usageTracker.FetchProviderBalanceAsync(_http, baseUrl, apiKey, provider?.Id ?? "deepseek");
+
+        // === 记录成功调用到健康监控 ===
+        _failover.RecordSuccess(model, (int)sw.ElapsedMilliseconds);
+
+        return (fullContent, reasoningContent, toolCalls.Values.ToList());
+    }
+
+    private async Task<string> ExecuteToolAsync(string name, string argumentsJson)
+    {
+        string? lockedFilePath = null;
+        try
+        {
+            var args = JsonNode.Parse(argumentsJson);
+
+            // 文件变更工具：执行前请求用户确认
+            if (name is "search_replace" or "create_file" or "delete_file" or "move_file" or "copy_file")
+            {
+                var fp = name switch
+                {
+                    "move_file" => args?["dest_path"]?.GetValue<string>() ?? args?["source_path"]?.GetValue<string>() ?? "",
+                    "copy_file" => args?["dest_path"]?.GetValue<string>() ?? args?["source_path"]?.GetValue<string>() ?? "",
+                    _ => args?["file_path"]?.GetValue<string>() ?? ""
+                };
+                if (OnPendingFileChange != null && !string.IsNullOrEmpty(fp))
+                {
+                    var accepted = await OnPendingFileChange(name, fp);
+                    if (!accepted)
+                        return $"{{\"success\":false,\"error\":\"用户拒绝了文件变更: {name} -> {fp.Replace("\\", "\\\\")}\"}}";
+                }
+            }
+
+            // 文件写操作：获取文件锁防止多会话并发修改
+            lockedFilePath = GetWriteFilePath(name, args);
+            if (lockedFilePath != null && _sessionManager != null)
+            {
+                var lockResult = _sessionManager.TryAcquireFileLock(lockedFilePath, _currentSessionId, out var lockMsg);
+                if (lockResult == FileLockService.LockResult.Conflict)
+                {
+                    var fileName = System.IO.Path.GetFileName(lockedFilePath);
+                    return $"{{\"success\":false,\"error\":\"⛔ 文件 [{fileName}] 正被其他会话修改中，请等待该会话完成后再试\"}}";
+                }
+            
+                // 写前自动备份（锁已获取，安全备份）
+                if (name is "search_replace" or "create_file" or "delete_file" or "move_file" or "rename_file"
+                    && name != "delete_file") // delete_file 不需要备份（文件会被删除）
+                {
+                    _sessionManager.FileLock.BackupBeforeWrite(lockedFilePath, _currentSessionId);
+                }
+            }
+
+            // 追踪代码修改和构建调用（用于自动构建验证）
+            if (name is "search_replace" or "create_file" or "delete_file" or "rename_file" or "move_file" or "copy_file")
+            {
+                var fp = name switch
+                {
+                    "move_file" => args?["dest_path"]?.GetValue<string>() ?? "",
+                    "copy_file" => args?["dest_path"]?.GetValue<string>() ?? "",
+                    _ => args?["file_path"]?.GetValue<string>() ?? ""
+                };
+                if (IsCodeFile(fp)) _codeModifiedInRound = true;
+            }
+            if (name == "build_project") _buildCalledInRound = true;
+
+            // 终端命令：危险命令/项目外路径操作执行前请求用户确认
+            if (name == AiConstants.ToolRunInTerminal)
+            {
+                var cmd = args?["command"]?.GetValue<string>() ?? "";
+                var isDangerous = IsDangerousCommand(cmd);
+                var hasExternalPath = ContainsExternalPath(cmd);
+            
+                // 沙箱服务前置校验（黑名单强制拦截 + 严格模式白名单）
+                if (_sandbox != null)
+                {
+                    var (sandboxBlocked, sandboxReason) = _sandbox.ValidateCommand(cmd);
+                    if (sandboxBlocked)
+                        return $"{{\"success\":false,\"error\":\"🛡️ 沙箱已拦截: {EscapeJson(sandboxReason)}\"}}";
+                }
+            
+                if (isDangerous || hasExternalPath)
+                {
+                    var pref = _config.GetAIConfig().TerminalExecutionPreference;
+                    if (pref == Models.TerminalExecutionPreference.AlwaysDeny)
+                    {
+                        var reason = isDangerous ? "危险命令" : "引用项目外路径";
+                        return $"{{\"success\":false,\"error\":\"⛔ 终端命令已被用户设置拒绝执行（始终拒绝模式）: {reason}\"}}";
+                    }
+                    if (pref == Models.TerminalExecutionPreference.AskEveryTime && OnTerminalCommandConfirm != null)
+                    {
+                        var warningExtra = hasExternalPath && !isDangerous ? "\n⚠️ 该命令引用了项目目录外的路径" : "";
+                        var (accepted, rememberChoice, alwaysAllow) = await OnTerminalCommandConfirm(cmd + warningExtra);
+                        if (rememberChoice)
+                        {
+                            _config.SetTerminalExecutionPreference(
+                                alwaysAllow ? Models.TerminalExecutionPreference.AlwaysAllow : Models.TerminalExecutionPreference.AlwaysDeny);
+                        }
+                        if (!accepted)
+                        {
+                            var safeCmd = EscapeJson(cmd.Length > 60 ? cmd[..57] + "..." : cmd);
+                            return $"{{\"success\":false,\"error\":\"用户拒绝了终端命令执行: {safeCmd}\"}}";
+                        }
+                    }
+                    // AlwaysAllow: 直接放行
+                }
+            }
+
+            // 联网搜索：未开启自动搜索时需要用户确认
+            if (name is AiConstants.ToolSearchWeb or AiConstants.ToolFetchContent)
+            {
+                var autoSearch = _config.GetAIConfig().AutoWebSearch;
+                if (!autoSearch && OnWebSearchConsent != null)
+                {
+                    var webQuery = name == "search_web"
+                        ? args?["query"]?.GetValue<string>() ?? ""
+                        : args?["url"]?.GetValue<string>() ?? "";
+                    var (accepted, rememberChoice) = await OnWebSearchConsent(webQuery, name);
+                    if (rememberChoice)
+                    {
+                        _config.SetAutoWebSearch(true);
+                    }
+                    if (!accepted)
+                    {
+                        var label = name == "search_web" ? "搜索" : "获取网页";
+                        return $"{{\"success\":false,\"error\":\"用户拒绝了联网{label}: {webQuery.Replace("\\", "\\\\").Replace("\"", "\\\"")[..Math.Min(webQuery.Length, 80)]}\"}}";
+                    }
+                }
+            }
+
+            return name switch
+            {
+                AiConstants.ToolReadFile => await ReadFileTool(args!),
+                "read_multiple_files" => await ReadMultipleFilesTool(args!),
+                AiConstants.ToolSearchReplace => await SearchReplaceTool(args!),
+                AiConstants.ToolCreateFile => await CreateFileTool(args!),
+                AiConstants.ToolDeleteFile => await DeleteFileTool(args!),
+                AiConstants.ToolRunInTerminal => await RunInTerminalTool(args!),
+                AiConstants.ToolListDir => await ListDirTool(args!),
+                AiConstants.ToolSearchFile => await SearchFileTool(args!),
+                "find_file" => await FindFileTool(args!),
+                AiConstants.ToolGrepCode => await GrepCodeTool(args!),
+                AiConstants.ToolSearchCodebase => await SearchCodebaseTool(args!),
+                AiConstants.ToolSearchSymbol => await SearchSymbolTool(args!),
+                AiConstants.ToolSearchWeb => await SearchWebTool(args!),
+                AiConstants.ToolFetchContent => await FetchContentTool(args!),
+                "scan_project" => await ScanProjectTool(args!),
+                "rename_file" => await RenameFileTool(args!),
+                "delete_dir" => await DeleteDirTool(args!),
+                "create_dir" => await CreateDirTool(args!),
+                "todo_write" => await TodoWriteTool(args!),
+                "algorithm_list" => await AlgorithmListTool(args!),
+                "algorithm_search" => await AlgorithmSearchTool(args!),
+                "algorithm_get" => await AlgorithmGetTool(args!),
+                "algorithm_create" => await AlgorithmCreateTool(args!),
+                "algorithm_update" => await AlgorithmUpdateTool(args!),
+                "algorithm_delete" => await AlgorithmDeleteTool(args!),
+                "algorithm_extract" => await AlgorithmExtractTool(args!),
+                "build_project" => await BuildProjectTool(args!),
+                "move_file" => await MoveFileTool(args!),
+                "copy_file" => await CopyFileTool(args!),
+                "agent" => await AgentTool(args!),
+                _ => "{\"success\":false,\"error\":\"Unknown tool\"}"
+            };
+        }
+        catch (Exception ex)
+        {
+            return $"{{\"success\":false,\"error\":\"{ex.Message.Replace("\"", "\\\"")}\"}}";
+        }
+        finally
+        {
+            // 释放文件锁
+            if (lockedFilePath != null && _sessionManager != null)
+            {
+                _sessionManager.ReleaseFileLock(lockedFilePath, _currentSessionId);
+            }
+        }
+    }
+
+    /// <summary>获取写操作对应的文件路径（用于文件锁），只读操作返回 null</summary>
+    private static string? GetWriteFilePath(string toolName, JsonNode? args)
+    {
+        if (args == null) return null;
+        return toolName switch
+        {
+            "search_replace" or "create_file" or "delete_file" or "rename_file"
+                => args["file_path"]?.GetValue<string>(),
+            "delete_dir" or "create_dir"
+                => args["path"]?.GetValue<string>(),
+            "move_file" => args["dest_path"]?.GetValue<string>(),
+            "copy_file" => args["dest_path"]?.GetValue<string>(),
+            _ => null
+        };
+    }
+
+    /// <summary>从工具参数中提取文件路径（用于日志展示）</summary>
+    private static string ExtractArgPath(ToolCall tc)
+    {
+        try
+        {
+            var args = JsonNode.Parse(tc.Arguments);
+            var fp = tc.Name switch
+            {
+                "move_file" => args?["dest_path"]?.GetValue<string>() ?? args?["source_path"]?.GetValue<string>(),
+                "copy_file" => args?["dest_path"]?.GetValue<string>() ?? args?["source_path"]?.GetValue<string>(),
+                _ => args?["file_path"]?.GetValue<string>() ?? args?["path"]?.GetValue<string>(),
+            };
+            return fp != null ? Path.GetFileName(fp) : "?";
+        }
+        catch { return "?"; }
+    }
+
+    /// <summary>执行单个工具调用并记录日志/发送事件</summary>
+    private async Task ExecuteAndLogToolAsync(ToolCall tc)
+    {
+        LogService.Instance.Info($"执行工具: {tc.Name}, 参数={Truncate(tc.Arguments, 100)}", "Tool");
+
+        // pre_tool 钩子
+        _ = _hooks?.RunHooksAsync("pre_tool", new Dictionary<string, string>
+        {
+            ["TOOL"] = tc.Name,
+            ["ARGS"] = tc.Arguments,
+            ["PROJECT"] = _fileOps.ProjectPath
+        });
+
+        var tcModel = new ToolCall { Id = tc.Id, Name = tc.Name, Arguments = tc.Arguments, Status = "running" };
+        OnToolCall?.Invoke(tcModel);
+
+        var execResult = await ExecuteToolAsync(tc.Name, tc.Arguments);
+        tcModel.Status = "done";
+        tcModel.Result = Truncate(execResult, 1000);
+        OnToolCall?.Invoke(tcModel);
+
+        // post_tool 钩子
+        _ = _hooks?.RunHooksAsync("post_tool", new Dictionary<string, string>
+        {
+            ["TOOL"] = tc.Name,
+            ["ARGS"] = tc.Arguments,
+            ["PROJECT"] = _fileOps.ProjectPath
+        });
+
+        var logResult = Truncate(execResult, 200);
+        if (execResult.Contains("\"success\":false") || execResult.Contains("\"error\":"))
+            LogService.Instance.Warn($"工具结果: {tc.Name} => {logResult}", "Tool");
+        else
+            LogService.Instance.Debug($"工具结果: {tc.Name} => {logResult}", "Tool");
+
+        var enrichedResult = EnrichToolResult(tc.Name, tc.Arguments, execResult);
+        _history.Add(new { role = "tool", tool_call_id = tc.Id, content = Truncate(enrichedResult, 20000) });
+    }
+
+    public void SetBackupService(BackupService backup)
+    {
+        _backup = backup;
+        _fileOps.SetBackupService(backup);
+    }
+
+    /// <summary>
+    /// 在批量工具执行前创建 checkpoint（≥2 个写文件时）
+    /// </summary>
+    private void StartBatchCheckpoint(List<ToolCall> toolCalls)
+    {
+        try
+        {
+            var writeFiles = toolCalls
+                .Where(tc => tc.Name is "search_replace" or "create_file" or "delete_file" or "move_file" or "rename_file")
+                .Select(tc =>
+                {
+                    var args = JsonNode.Parse(tc.Arguments);
+                    return tc.Name switch
+                    {
+                        "move_file" => args?["dest_path"]?.GetValue<string>() ?? "",
+                        "copy_file" => args?["dest_path"]?.GetValue<string>() ?? "",
+                        _ => args?["file_path"]?.GetValue<string>() ?? ""
+                    };
+                })
+                .Where(fp => !string.IsNullOrEmpty(fp))
+                .Select(fp => _fileOps.ResolvePath(fp))
+                .Where(fp => !string.IsNullOrEmpty(fp) && File.Exists(fp))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            // 检测是否有 search_replace 的 replace_all（大范围全局替换）
+            var hasGlobalReplace = toolCalls.Any(tc =>
+                tc.Name == "search_replace" &&
+                (JsonNode.Parse(tc.Arguments)?["replace_all"]?.GetValue<bool>() ?? false));
+
+            if (writeFiles.Length >= 2)
+            {
+                // 磁盘空间安全检查
+                if (!(_backup?.HasSufficientDiskSpace(100) ?? true))
+                {
+                    LogService.Instance.Warn("磁盘空间不足，跳过 Git 快照但继续创建 checkpoint");
+                }
+                else
+                {
+                    // 先尝试 Git 快照（最强的保护层级）
+                    _backup?.SafeGitSnapshot($"批量修改 {writeFiles.Length} 个文件");
+                }
+
+                _checkpointId = _backup?.CreateCheckpoint(writeFiles, _currentSessionId, toolCalls.Count);
+                if (_checkpointId != null)
+                    LogService.Instance.Info($"批量变更 Checkpoint 已创建: {_checkpointId}, {writeFiles.Length} 个文件", "AI");
+
+                // ===== 大批量修改提示用户手动备份 =====
+                if (writeFiles.Length >= 3 || hasGlobalReplace)
+                {
+                    var fileList = string.Join("\n", writeFiles.Take(5).Select(f => $"  • {Path.GetFileName(f)}"));
+                    var suffix = writeFiles.Length > 5 ? $"\n  ... 等共 {writeFiles.Length} 个文件" : "";
+                    var warningMsg = hasGlobalReplace
+                        ? $"\n⚠️ **检测到大范围全局替换操作**，涉及 {writeFiles.Length} 个文件：\n{fileList}{suffix}\n\n> 💡 系统已自动创建 checkpoint 快照，但建议你额外手动备份（如 git commit）以防万一。\n"
+                        : $"\n⚠️ **即将批量修改 {writeFiles.Length} 个文件**：\n{fileList}{suffix}\n\n> 💡 系统已自动创建 checkpoint + Git 快照，建议你也手动做一次备份（如 `git add . && git commit -m \"备份\"`）。\n";
+                    OnChunk?.Invoke(warningMsg);
+                }
+            }
+            else if (writeFiles.Length == 1)
+            {
+                // 单文件修改也尝试 Git 快照
+                _backup?.SafeGitSnapshot($"修改 {Path.GetFileName(writeFiles[0])}");
+            }
+        }
+        catch (Exception ex) { LogService.Instance.Debug($"批量文件操作快照失败: {ex.Message}", "AI"); }
+    }
+
+    /// <summary>
+    /// 批量工具执行完成后完成 checkpoint（正常完成则清理）
+    /// </summary>
+    private void FinishBatchCheckpoint()
+    {
+        if (_checkpointId == null) return;
+        try
+        {
+            _backup?.CompleteCheckpoint(_checkpointId);
+            LogService.Instance.Debug($"批量变更 Checkpoint 已完成: {_checkpointId}", "AI");
+        }
+        catch (Exception ex) { LogService.Instance.Debug($"Checkpoint 完成失败: {ex.Message}", "AI"); }
+    }
+
+    /// <summary>取消当前 AI 请求（停止对话/推理/写代码）</summary>
+    public void Cancel()
+    {
+        _cts?.Cancel();
+        LogService.Instance.Info("AI 请求已取消");
+    }
+
+    private string GetSystemPrompt()
+    {
+        // 根据当前项目语言动态注入编码规范指南
+        var lang = _buildService.DetectLanguage();
+        if (!string.IsNullOrEmpty(lang) && lang != "未知")
+            _promptService.AppendLanguageGuidelines(lang);
+
+        // 构建并注入项目上下文摘要
+        var contextSummary = GetProjectContextSummary();
+        _promptService.SetProjectContext(contextSummary);
+
+        return _promptService.GetSystemPrompt();
+    }
+
+    /// <summary>
+    /// 构建项目上下文摘要，动态注入到系统提示词中。
+    /// 包含：项目类型、主要目录结构、关键文件、依赖关系。
+    /// </summary>
+    private string GetProjectContextSummary()
+    {
+        var sb = new System.Text.StringBuilder();
+
+        try
+        {
+            if (string.IsNullOrEmpty(_projectPath) || !Directory.Exists(_projectPath))
+            {
+                sb.AppendLine("当前未加载项目。请用户先打开一个项目。");
+                return sb.ToString();
+            }
+
+            var projName = Path.GetFileName(_projectPath);
+            var lang = _buildService.DetectLanguage();
+            sb.AppendLine($"**项目**: {projName} | **语言**: {(lang ?? "未知")} | **类型**: WPF桌面应用");
+            sb.AppendLine();
+
+            // 关键目录
+            var dirs = new[] { "Services", "ViewModels", "Views", "Models", "Controls", "Converters", "Tests", "Tools" };
+            var existingDirs = dirs.Where(d => Directory.Exists(Path.Combine(_projectPath, d))).ToList();
+            if (existingDirs.Count > 0)
+            {
+                sb.AppendLine($"**关键目录**: {string.Join(", ", existingDirs)}");
+            }
+
+            // 扫描关键文件（项目配置）
+            var keyFiles = new[] { "AIIDEWPF.csproj", "AIIDEWPF.sln", "App.xaml", "App.xaml.cs" };
+            foreach (var f in keyFiles)
+            {
+                var fp = Path.Combine(_projectPath, f);
+                if (File.Exists(fp))
+                    sb.AppendLine($"- {f} (配置文件)");
+            }
+
+            // Services 目录摘要
+            var servicesDir = Path.Combine(_projectPath, "Services");
+            if (Directory.Exists(servicesDir))
+            {
+                var svcFiles = Directory.GetFiles(servicesDir, "*.cs")
+                    .Select(f => Path.GetFileName(f))
+                    .OrderBy(f => f)
+                    .ToList();
+                var coreServices = svcFiles
+                    .Where(f => f.Contains("AIService") || f.Contains("Config") || f.Contains("ModelManager")
+                        || f.Contains("Prompt") || f.Contains("ChatMode") || f.Contains("File"))
+                    .ToList();
+                if (coreServices.Count > 0)
+                {
+                    sb.AppendLine($"\n**核心服务** ({svcFiles.Count}个服务文件):");
+                    foreach (var s in coreServices.Take(8))
+                        sb.AppendLine($"  - {s}");
+                    if (svcFiles.Count > 8)
+                        sb.AppendLine($"  ... 等共 {svcFiles.Count} 个服务");
+                }
+            }
+
+            // ViewModels 摘要
+            var vmsDir = Path.Combine(_projectPath, "ViewModels");
+            if (Directory.Exists(vmsDir))
+            {
+                var vmFiles = Directory.GetFiles(vmsDir, "*.cs")
+                    .Select(f => Path.GetFileName(f))
+                    .Where(f => f.EndsWith("ViewModel.cs"))
+                    .OrderBy(f => f)
+                    .ToList();
+                if (vmFiles.Count > 0)
+                {
+                    sb.AppendLine($"\n**视图模型**: {string.Join(", ", vmFiles)}");
+                }
+            }
+
+            // Views 摘要
+            var viewsDir = Path.Combine(_projectPath, "Views");
+            if (Directory.Exists(viewsDir))
+            {
+                var xamlFiles = Directory.GetFiles(viewsDir, "*.xaml")
+                    .Select(f => Path.GetFileName(f))
+                    .OrderBy(f => f)
+                    .ToList();
+                if (xamlFiles.Count > 0)
+                {
+                    sb.AppendLine($"\n**视图文件** ({xamlFiles.Count}个XAML): {string.Join(", ", xamlFiles.Take(6))}");
+                    if (xamlFiles.Count > 6)
+                        sb.AppendLine($"  ... 等共 {xamlFiles.Count} 个视图");
+                }
+            }
+
+            sb.AppendLine($"\n**操作提示**: 修改代码前先 read_file 查看完整内容。修改后运行 build_project 验证编译。");
+        }
+        catch (Exception ex)
+        {
+            sb.AppendLine($"(项目上下文加载异常: {ex.Message})");
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// 从用户消息中自动检测文件名/类名，尝试读取并注入为上下文。
+    /// 控制注入量不超过模型限制的40%。
+    /// </summary>
+    private async Task<string> BuildAutoContextAsync(string message, string currentSystemPrompt)
+    {
+        if (string.IsNullOrEmpty(_projectPath) || !Directory.Exists(_projectPath))
+            return string.Empty;
+
+        try
+        {
+            // 从用户消息中提取可能的文件名
+            var filePattern = new Regex(@"\b([\w\-\.]+)\.(cs|csproj|xaml|json|xml|config|cshtml|razor|sln)\b",
+                RegexOptions.IgnoreCase);
+            var matches = filePattern.Matches(message);
+
+            if (matches.Count == 0)
+                return string.Empty;
+
+            var sb = new System.Text.StringBuilder();
+            var budgetChars = 3000; // 自动注入上下文预算
+            var maxFiles = 3; // 最多注入3个文件
+            var filesAdded = 0;
+
+            foreach (Match match in matches)
+            {
+                if (filesAdded >= maxFiles || budgetChars <= 0)
+                    break;
+
+                var fileName = match.Value;
+                // 在项目中搜索该文件
+                var foundFiles = Directory.GetFiles(_projectPath, fileName, SearchOption.AllDirectories);
+                if (foundFiles.Length == 0)
+                    continue;
+
+                foreach (var fp in foundFiles.Take(1)) // 每个文件名最多取1个匹配
+                {
+                    try
+                    {
+                        var content = await File.ReadAllTextAsync(fp);
+                        var truncated = Truncate(content, Math.Min(budgetChars, 2000));
+                        var relativePath = Path.GetRelativePath(_projectPath, fp);
+                        sb.AppendLine($"### 文件: {relativePath}");
+                        sb.AppendLine("```");
+                        sb.AppendLine(truncated);
+                        sb.AppendLine("```");
+                        sb.AppendLine();
+                        budgetChars -= truncated.Length;
+                        filesAdded++;
+                    }
+                    catch { /* 读取失败跳过 */ }
+                }
+            }
+
+            return sb.Length > 0 ? sb.ToString() : string.Empty;
+        }
+        catch (Exception ex)
+        {
+            LogService.Instance.Debug($"自动上下文构建异常: {ex.Message}", "AI");
+            return string.Empty;
+        }
+    }
+
+    /// <summary>指数退避延迟计算：1s/2s/4s/8s/16s 渐进式，429优先用Retry-After头</summary>
+    private int GetRetryDelay(int statusCode, HttpResponseMessage response)
+    {
+        // 429 优先使用服务端 Retry-After 头
+        if (statusCode == 429)
+        {
+            if (response.Headers.TryGetValues("Retry-After", out var vals))
+            {
+                var val = vals.FirstOrDefault();
+                if (int.TryParse(val, out var secs) && secs > 0)
+                    return Math.Min(secs, 60);
+            }
+        }
+        // 渐进式退避: 1s / 2s / 4s / 8s / 16s (基于重试次数)
+        var retryNum = Math.Max(_retryCount, 1);
+        return Math.Min((int)Math.Pow(2, retryNum - 1), 30);
+    }
+
+    private static string Truncate(string text, int maxLen) =>
+        text.Length <= maxLen ? text : text[..maxLen];
+
+    /// <summary>转义字符串用于嵌入 JSON 字符串</summary>
+    private static string EscapeJson(string text)
+        => text.Replace("\\", "\\\\").Replace("\"", "\\\"");
+
+    /// <summary>增强工具返回结果，为 LLM 提供更丰富的上下文以便后续决策</summary>
+    private static string EnrichToolResult(string toolName, string arguments, string rawResult)
+    {
+        // 文件修改类工具：附加验证提示和最佳实践
+        if (toolName is "search_replace" or "create_file" or "delete_file" or "rename_file" or "move_file" or "copy_file")
+        {
+            var suffix = toolName switch
+            {
+                "search_replace" => "\n[验证提示: 修改已完成。请用 read_file 验证修改结果是否正确。如项目可编译请运行 build_project。确认无误后再进行下一步。]",
+                "create_file" => "\n[验证提示: 文件已创建。请用 read_file 确认内容格式正确，检查命名空间和引用是否匹配项目规范。]",
+                "delete_file" => "\n[验证提示: 文件已删除。请检查是否有其他文件 import/reference 此文件，需要更新依赖引用。]",
+                "rename_file" or "move_file" => "\n[验证提示: 文件已移动/重命名。请务必扫描项目并更新所有引用此文件的 import/using 路径，否则会导致编译错误。]",
+                "copy_file" => "\n[验证提示: 文件已复制。新文件与源文件内容相同，请根据需求修改。]",
+                _ => ""
+            };
+            // 检测操作是否成功
+            if (rawResult.Contains("\"success\":false") || rawResult.Contains("\"error\":"))
+            {
+                suffix += "\n[操作失败！请仔细阅读错误信息，检查文件路径是否正确、original_text是否精确匹配、或文件是否已被锁定。]";
+            }
+            return rawResult + suffix;
+        }
+
+        // 创建目录：提示目录创建后可在其中创建文件
+        if (toolName == "create_dir")
+        {
+            return rawResult + "\n[提示: 目录已创建。现在可以用 create_file 在其中创建文件。请确保文件放在正确的目录层级。]";
+        }
+
+        // 删除目录：警告递归删除
+        if (toolName == "delete_dir")
+        {
+            return rawResult + "\n[提示: 目录及其所有内容已递归删除。请二次确认没有重要文件被误删。]";
+        }
+
+        // 构建工具：如果失败，给出明确指引
+        if (toolName == "build_project")
+        {
+            if (rawResult.Contains("\"success\":false"))
+            {
+                var guidance = "\n[构建失败！请按以下步骤排查:\n" +
+                    "1. 仔细阅读上方的错误信息(stderr)定位具体文件和行号\n" +
+                    "2. 用 read_file 查看出错文件的完整内容\n" +
+                    "3. 分析错误原因(语法错误/类型不匹配/缺少引用等)\n" +
+                    "4. 用 search_replace 精准修复\n" +
+                    "5. 修复后重新 build_project 验证\n" +
+                    "不要猜测，要基于实际错误信息来修复。]";
+                return rawResult + guidance;
+            }
+            return rawResult;
+        }
+
+        return rawResult;
+    }
+
+    private object[] GetToolsForMode()
+    {
+        var all = GetToolDefinitions();
+        var disabledTools = _chatModeService.GetDisabledTools();
+        if (disabledTools.Length == 0) return all;
+
+        // 根据模式禁用对应工具
+        return all.Where(t =>
+        {
+            var name = ((dynamic)t).function.name as string;
+            return !disabledTools.Contains(name);
+        }).ToArray();
+    }
+
+    /// <summary>构建 assistant 消息，无 tool_calls 时不带 content=null，含 reasoning 时回传</summary>
+    private static Dictionary<string, object?> MsgAssistant(string? content, List<ToolCall>? toolCalls = null, string? reasoningContent = null)
+    {
+        var d = new Dictionary<string, object?> { ["role"] = AiConstants.RoleAssistant };
+        if (content != null) d["content"] = content;
+        if (!string.IsNullOrEmpty(reasoningContent)) d["reasoning_content"] = reasoningContent;
+        if (toolCalls != null) d["tool_calls"] = toolCalls;
+        return d;
+    }
+
+    private static object[] GetToolDefinitions()
+    {
+        var todoFunc = new Dictionary<string, object?>
+        {
+            ["name"] = "todo_write",
+            ["description"] = "Create and manage a task list for complex multi-step work. Use merge=true to update existing todos (preserving completed items). Each task should be independently verifiable and produce a testable outcome. Update status to 'completed' IMMEDIATELY after finishing each step.",
+            ["parameters"] = new Dictionary<string, object?>
+            {
+                ["type"] = "object",
+                ["properties"] = new Dictionary<string, object?>
+                {
+                    ["merge"] = new { type = "boolean", description = "Whether to merge with existing todos. true=update existing (by id matching), false=replace all" },
+                    ["items"] = new Dictionary<string, object?>
+                    {
+                        ["type"] = "array",
+                        ["description"] = "Array of todo items. Each item should represent a single, verifiable step.",
+                        ["items"] = new Dictionary<string, object?>
+                        {
+                            ["type"] = "object",
+                            ["properties"] = new Dictionary<string, object?>
+                            {
+                                ["id"] = new { type = "string", description = "Unique task ID (for status updates). Use stable IDs to update progress across calls." },
+                                ["content"] = new { type = "string", description = "Task description — be specific: what file(s) to modify, what change to make, what outcome to expect" },
+                                ["status"] = new { type = "string", description = "Task status: pending (not started), in_progress (currently working on), completed (finished successfully), cancelled (no longer needed)" }
+                            },
+                            ["required"] = new[] { "content", "status" }
+                        }
+                    }
+                },
+                ["required"] = new[] { "merge", "items" }
+            }
+        };
+        var todoWrite = new { type = "function", function = todoFunc };
+
+        var algListFunc = new Dictionary<string, object?>
+        {
+            ["name"] = "algorithm_list",
+            ["description"] = "List all algorithms in the project algorithm library. Optionally filter by category or language.",
+            ["parameters"] = new Dictionary<string, object?>
+            {
+                ["type"] = "object",
+                ["properties"] = new Dictionary<string, object?>
+                {
+                    ["category"] = new { type = "string", description = "Filter by category: sort, search, graph, dp, string, math, tree, greedy, backtracking, general" },
+                    ["language"] = new { type = "string", description = "Filter by programming language: C#, Python, Java, etc." }
+                },
+                ["required"] = new string[] { }
+            }
+        };
+
+        var algSearchFunc = new Dictionary<string, object?>
+        {
+            ["name"] = "algorithm_search",
+            ["description"] = "Search algorithms by keyword (searches name, description, category, language, tags, and code content).",
+            ["parameters"] = new Dictionary<string, object?>
+            {
+                ["type"] = "object",
+                ["properties"] = new Dictionary<string, object?>
+                {
+                    ["keyword"] = new { type = "string", description = "Search keyword to find matching algorithms" }
+                },
+                ["required"] = new[] { "keyword" }
+            }
+        };
+
+        var algGetFunc = new Dictionary<string, object?>
+        {
+            ["name"] = "algorithm_get",
+            ["description"] = "Get the full details and code of an algorithm by its ID.",
+            ["parameters"] = new Dictionary<string, object?>
+            {
+                ["type"] = "object",
+                ["properties"] = new Dictionary<string, object?>
+                {
+                    ["id"] = new { type = "string", description = "Algorithm ID (8-char hex string)" }
+                },
+                ["required"] = new[] { "id" }
+            }
+        };
+
+        var algCreateFunc = new Dictionary<string, object?>
+        {
+            ["name"] = "algorithm_create",
+            ["description"] = "Add a new algorithm to the project algorithm library for unified management.",
+            ["parameters"] = new Dictionary<string, object?>
+            {
+                ["type"] = "object",
+                ["properties"] = new Dictionary<string, object?>
+                {
+                    ["name"] = new { type = "string", description = "Algorithm name, e.g. QuickSort" },
+                    ["description"] = new { type = "string", description = "Brief description of what the algorithm does" },
+                    ["language"] = new { type = "string", description = "Programming language: C#, Python, Java, etc." },
+                    ["code"] = new { type = "string", description = "Full source code implementation" },
+                    ["category"] = new { type = "string", description = "Category: sort, search, graph, dp, string, math, tree, greedy, backtracking, general" },
+                    ["complexity"] = new { type = "string", description = "Time complexity, e.g. O(n log n)" },
+                    ["space_complexity"] = new { type = "string", description = "Space complexity, e.g. O(1)" },
+                    ["tags"] = new { type = "array", items = new { type = "string" }, description = "Tags for classification" }
+                },
+                ["required"] = new[] { "name", "language", "code" }
+            }
+        };
+
+        var algUpdateFunc = new Dictionary<string, object?>
+        {
+            ["name"] = "algorithm_update",
+            ["description"] = "Update an existing algorithm's metadata or code.",
+            ["parameters"] = new Dictionary<string, object?>
+            {
+                ["type"] = "object",
+                ["properties"] = new Dictionary<string, object?>
+                {
+                    ["id"] = new { type = "string", description = "Algorithm ID to update" },
+                    ["name"] = new { type = "string", description = "New name (optional)" },
+                    ["description"] = new { type = "string", description = "New description (optional)" },
+                    ["code"] = new { type = "string", description = "New code implementation (optional)" },
+                    ["category"] = new { type = "string", description = "New category (optional)" },
+                    ["complexity"] = new { type = "string", description = "New time complexity (optional)" },
+                    ["space_complexity"] = new { type = "string", description = "New space complexity (optional)" },
+                    ["tags"] = new { type = "array", items = new { type = "string" }, description = "New tags (optional)" }
+                },
+                ["required"] = new[] { "id" }
+            }
+        };
+
+        var algDeleteFunc = new Dictionary<string, object?>
+        {
+            ["name"] = "algorithm_delete",
+            ["description"] = "Delete an algorithm from the algorithm library by its ID.",
+            ["parameters"] = new Dictionary<string, object?>
+            {
+                ["type"] = "object",
+                ["properties"] = new Dictionary<string, object?>
+                {
+                    ["id"] = new { type = "string", description = "Algorithm ID to delete" }
+                },
+                ["required"] = new[] { "id" }
+            }
+        };
+
+        var algExtractFunc = new Dictionary<string, object?>
+        {
+            ["name"] = "algorithm_extract",
+            ["description"] = "Automatically scan the project for functions/methods and extract them as algorithms into the algorithm library. Use this when the user says 'extract algorithms from my code' or wants to build an algorithm library from existing code.",
+            ["parameters"] = new Dictionary<string, object?>
+            {
+                ["type"] = "object",
+                ["properties"] = new Dictionary<string, object?>
+                {
+                    ["max_files"] = new { type = "integer", description = "Max source files to scan, default 50" }
+                },
+                ["required"] = new string[] { }
+            }
+        };
+
+        return new object[]
+        {
+        new { type = "function", function = new { name = "read_file", description = "Read file content with optional line range", parameters = new { type = "object", properties = new { file_path = new { type = "string", description = "Absolute file path" }, start_line = new { type = "integer" }, end_line = new { type = "integer" } }, required = new[] { "file_path" } } } },
+        new { type = "function", function = new { name = "read_multiple_files", description = "Batch read up to 10 files at once. Optionally limit lines per file. Use when you need to understand several related files together.", parameters = new { type = "object", properties = new { file_paths = new { type = "array", items = new { type = "string" }, description = "Absolute file paths to read (max 10)" }, max_lines_per_file = new { type = "integer", description = "Max lines per file, omit for full content" } }, required = new[] { "file_paths" } } } },
+        new { type = "function", function = new { name = "search_replace", description = "Search and replace text in file", parameters = new { type = "object", properties = new { file_path = new { type = "string" }, original_text = new { type = "string" }, new_text = new { type = "string" }, replace_all = new { type = "boolean" } }, required = new[] { "file_path", "original_text", "new_text" } } } },
+        new { type = "function", function = new { name = "create_file", description = "Create a new file (parent dirs auto-created)", parameters = new { type = "object", properties = new { file_path = new { type = "string" }, file_content = new { type = "string" } }, required = new[] { "file_path", "file_content" } } } },
+        new { type = "function", function = new { name = "delete_file", description = "Delete a file", parameters = new { type = "object", properties = new { file_path = new { type = "string" } }, required = new[] { "file_path" } } } },
+        new { type = "function", function = new { name = "move_file", description = "Move a file or directory to a new location. Source must exist, destination parent dirs auto-created. Use to reorganize project structure.", parameters = new { type = "object", properties = new { source_path = new { type = "string", description = "Full path of source file/directory" }, dest_path = new { type = "string", description = "Full path of destination" } }, required = new[] { "source_path", "dest_path" } } } },
+        new { type = "function", function = new { name = "copy_file", description = "Copy a file to a new location. Fails if destination already exists. Use to duplicate templates or create variants.", parameters = new { type = "object", properties = new { source_path = new { type = "string", description = "Full path of source file" }, dest_path = new { type = "string", description = "Full path of destination" } }, required = new[] { "source_path", "dest_path" } } } },
+        new { type = "function", function = new { name = "run_in_terminal", description = "Run shell command", parameters = new { type = "object", properties = new { command = new { type = "string" }, cwd = new { type = "string" }, timeout = new { type = "integer" } }, required = new[] { "command" } } } },
+        new { type = "function", function = new { name = "list_dir", description = "List directory", parameters = new { type = "object", properties = new { path = new { type = "string" } }, required = new[] { "path" } } } },
+        new { type = "function", function = new { name = "search_file", description = "Search by glob pattern", parameters = new { type = "object", properties = new { query = new { type = "string" }, path = new { type = "string" } }, required = new[] { "query" } } } },
+        new { type = "function", function = new { name = "find_file", description = "Fuzzy search for files by filename or partial path. Use when you can't find a file at the expected path — this tool searches the entire project and ranks matches by relevance. Returns relative paths, absolute paths, file names, and sizes.", parameters = new { type = "object", properties = new { filename = new { type = "string", description = "File name or partial path to search for (e.g., 'AIService.cs' or 'Services/AI')" }, search_root = new { type = "string", description = "Optional: limit search to a specific directory. Defaults to project root." } }, required = new[] { "filename" } } } },
+        new { type = "function", function = new { name = "grep_code", description = "Regex search code", parameters = new { type = "object", properties = new { regex = new { type = "string" }, path = new { type = "string" }, glob = new { type = "string" } }, required = new[] { "regex" } } } },
+        new { type = "function", function = new { name = "search_codebase", description = "Semantic code search", parameters = new { type = "object", properties = new { query = new { type = "string" }, key_words = new { type = "string" } }, required = new[] { "query", "key_words" } } } },
+        new { type = "function", function = new { name = "search_symbol", description = "Search symbol definitions", parameters = new { type = "object", properties = new { symbol = new { type = "string" } }, required = new[] { "symbol" } } } },
+        new { type = "function", function = new { name = "search_web", description = "Search the web", parameters = new { type = "object", properties = new { query = new { type = "string" } }, required = new[] { "query" } } } },
+        new { type = "function", function = new { name = "fetch_content", description = "Fetch web page", parameters = new { type = "object", properties = new { url = new { type = "string" } }, required = new[] { "url" } } } },
+        new { type = "function", function = new { name = "scan_project", description = "Scan project directory structure recursively. Use to understand project layout before modifying code.", parameters = new { type = "object", properties = new { path = new { type = "string", description = "Directory path to scan, defaults to project root" }, depth = new { type = "integer", description = "Max recursion depth, default 3" } }, required = new string[] { } } } },
+        new { type = "function", function = new { name = "rename_file", description = "Rename a file or directory", parameters = new { type = "object", properties = new { file_path = new { type = "string", description = "Full path of file/directory to rename" }, new_name = new { type = "string", description = "New name (NOT full path, just the new name)" } }, required = new[] { "file_path", "new_name" } } } },
+        new { type = "function", function = new { name = "delete_dir", description = "Delete a directory and all its contents recursively. ONLY use when explicitly asked to delete directories.", parameters = new { type = "object", properties = new { path = new { type = "string", description = "Full path of directory to delete" } }, required = new[] { "path" } } } },
+        new { type = "function", function = new { name = "create_dir", description = "Create a new directory/folder. Use this when the user asks to create a folder, organize files into subdirectories, or set up project structure. Parent directories are created automatically if needed.", parameters = new { type = "object", properties = new { path = new { type = "string", description = "Full absolute path of the directory to create" } }, required = new[] { "path" } } } },
+        new { type = "function", function = algListFunc },
+        new { type = "function", function = algSearchFunc },
+        new { type = "function", function = algGetFunc },
+        new { type = "function", function = algCreateFunc },
+        new { type = "function", function = algUpdateFunc },
+        new { type = "function", function = algDeleteFunc },
+        new { type = "function", function = algExtractFunc },
+        new { type = "function", function = new { name = "build_project", description = "Build, compile, verify, or package the current project. Auto-detects language from project files. Supports 50+ languages. Use when the user asks to build, compile, package, verify, or check which language a project uses. Use action='verify' to auto-detect language AND compile in one step — this is the recommended action for post-modification verification. NOTE: This tool is automatically called after code modifications; you do NOT need to call it manually unless you want preemptive verification. If the user says '不构建/不用构建/skip build', automatic build is suppressed.", parameters = new { type = "object", properties = new { action = new { type = "string", description = "Action: detect (detect language), build (compile), verify (auto-detect + build, recommended for verification), package (create distributable), list (list supported languages)" }, language = new { type = "string", description = "Optional: force a specific language instead of auto-detect" } }, required = new[] { "action" } } } },
+        todoWrite,
+        new { type = "function", function = new { name = "agent", description = "Launch a specialized sub-agent to handle complex, multi-step tasks autonomously. Types: browser (web search, content fetching), codereview (professional code review). Use for web research, code review tasks.", parameters = new { type = "object", properties = new { agent_type = new { type = "string", description = "Sub-agent type: browser or codereview" }, task = new { type = "string", description = "Task description for the sub-agent" } }, required = new[] { "agent_type", "task" } } } }
+    };
+    }
+
+    /// <summary>检测 AI 回复中是否存在中英文混合的情况</summary>
+    /// <param name="text">AI 回复的完整文本</param>
+    /// <param name="mixedRatio">混合比例 (0~1)</param>
+    /// <returns>如果检测到明显的中英文混合返回 true</returns>
+    private static bool DetectLanguageMixing(string text, out double mixedRatio)
+    {
+        mixedRatio = 0;
+        if (string.IsNullOrWhiteSpace(text) || text.Length < 30) return false;
+
+        // 统计中文字符
+        int chineseChars = 0;
+        int englishWords = 0;
+        bool inWord = false;
+
+        for (int i = 0; i < text.Length; i++)
+        {
+            char c = text[i];
+            // 中文字符 (CJK Unified Ideographs + Extension A)
+            if (c >= 0x4E00 && c <= 0x9FFF ||
+                c >= 0x3400 && c <= 0x4DBF ||
+                c >= 0xFF01 && c <= 0xFF5E) // 全角标点
+            {
+                chineseChars++;
+                if (inWord) { englishWords++; inWord = false; }
+            }
+            else if (char.IsLetter(c))
+            {
+                inWord = true;
+            }
+            else
+            {
+                if (inWord) { englishWords++; inWord = false; }
+            }
+        }
+        if (inWord) englishWords++;
+
+        // 如果中文字符 < 15 或英文单词 < 5，不算混合（可能是代码注释等）
+        if (chineseChars < 15 || englishWords < 5) return false;
+
+        // 计算混合比例：两种语言同时大量存在时才算混合
+        int total = chineseChars + englishWords;
+        double chineseRatio = (double)chineseChars / total;
+        double englishRatio = (double)englishWords / total;
+
+        // 两种语言都在 15%~85% 之间 = 明显混合
+        mixedRatio = Math.Abs(chineseRatio - 0.5) * 2; // 0=完美混合, 1=纯一种语言
+        return chineseRatio > 0.15 && englishRatio > 0.15;
+    }
+
+    /// <summary>检测用户消息是否为复杂任务，需要在 system prompt 中注入规划提醒</summary>
+    private static bool DetectComplexTask(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message) || message.Length < 80) return false;
+
+        var complexityKeywords = new[]
+        {
+            "实现", "重构", "改造", "新建", "开发", "架构", "设计",
+            "迁移", "升级", "集成", "优化", "多线程", "并发",
+            "数据库", "缓存", "中间件", "API", "接口", "模块", "插件",
+            "全栈", "端到端", "整体", "全部", "整个", "所有",
+            "新增功能", "修改所有", "批量", "整个项目",
+            "implement", "refactor", "migrate", "architecture"
+        };
+
+        var msgLower = message.ToLower();
+        int hitCount = complexityKeywords.Count(k => msgLower.Contains(k.ToLower()));
+
+        // 命中 >= 3 个关键词 或 消息超过 500 字符 → 复杂任务
+        return hitCount >= 3 || message.Length > 500;
+    }
+
+    /// <summary>判断是否为可编译的代码文件</summary>
+    private static bool IsCodeFile(string filePath)
+    {
+        if (string.IsNullOrEmpty(filePath)) return false;
+        var ext = System.IO.Path.GetExtension(filePath).ToLowerInvariant();
+        return ext switch
+        {
+            ".cs" or ".java" or ".py" or ".js" or ".ts" or ".tsx" or ".jsx"
+                or ".go" or ".rs" or ".c" or ".h" or ".cpp" or ".cc" or ".cxx" or ".hpp"
+                or ".swift" or ".kt" or ".kts" or ".dart" or ".php" or ".rb"
+                or ".scala" or ".hs" or ".erl" or ".ex" or ".exs" or ".clj"
+                or ".fs" or ".fsx" or ".vb" or ".groovy" or ".m" or ".mm"
+                or ".asm" or ".s" or ".v" or ".zig" or ".nim" or ".cr"
+                or ".ml" or ".mli" or ".re" or ".purs" or ".elm" or ".hx"
+                or ".vala" or ".adb" or ".ads" or ".f90" or ".f" or ".f95"
+                or ".cbl" or ".cob" or ".pas" or ".d" or ".rkt" => true,
+            _ => false
+        };
+    }
+
+    /// <summary>判断是否应该自动构建：代码已修改 + 未调用过构建 + 用户未禁止</summary>
+    private bool ShouldAutoBuild()
+    {
+        if (!_codeModifiedInRound) return false;
+        if (_buildCalledInRound) return false;
+        if (_chatModeService.IsQAMode) return false;
+
+        // 检查用户是否明确禁止构建
+        var noBuildKeywords = new[] { "不构建", "不用构建", "不需要编译", "不要编译",
+            "不编译", "不用编译", "skip build", "no build", "don't build", "不自动构建" };
+        foreach (var msg in _history)
+        {
+            if (msg is Dictionary<string, object?> d && d.TryGetValue("role", out var r)
+                && r is string rs && rs == "user")
+            {
+                var content = d.TryGetValue("content", out var c) ? c?.ToString() ?? "" : "";
+                foreach (var kw in noBuildKeywords)
+                {
+                    if (content.Contains(kw, StringComparison.OrdinalIgnoreCase))
+                        return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 根据任务类型动态调整 temperature：
+    /// 代码生成/修改 → 0.3 (精确)，创意/设计 → 0.7，问答/解释 → 0.5
+    /// </summary>
+    private static double GetDynamicTemperature(List<object> messages)
+    {
+        // 获取最后一条用户消息
+        string? lastUserMsg = null;
+        for (int i = messages.Count - 1; i >= 0; i--)
+        {
+            if (messages[i] is Dictionary<string, object?> d &&
+                d.TryGetValue("role", out var r) && r is string rs && rs == "user")
+            {
+                lastUserMsg = d.TryGetValue("content", out var c) ? c?.ToString() ?? "" : "";
+                break;
+            }
+        }
+
+        if (string.IsNullOrEmpty(lastUserMsg))
+            return 0.5; // 默认中等
+
+        var lower = lastUserMsg.ToLowerInvariant();
+
+        // 代码生成/修改类任务 — 需要精确
+        var codeGenKeywords = new[]
+        {
+            "write", "create", "implement", "generate", "code", "function", "class",
+            "编写", "创建", "实现", "生成", "代码", "函数", "类", "修改", "修复", "fix",
+            "search_replace", "create_file", "refactor", "重构"
+        };
+        foreach (var kw in codeGenKeywords)
+        {
+            if (lower.Contains(kw))
+                return 0.3;
+        }
+
+        // 创意/设计/架构类任务 — 需要多样性
+        var creativeKeywords = new[]
+        {
+            "design", "architecture", "suggest", "recommend", "brainstorm", "idea",
+            "设计", "架构", "建议", "方案", "创意", "推荐", "plan", "规划"
+        };
+        foreach (var kw in creativeKeywords)
+        {
+            if (lower.Contains(kw))
+                return 0.7;
+        }
+
+        // 问答/解释类 — 中等
+        return 0.5;
+    }
+
+    /// <summary>检测终端命令是否引用了项目目录外的路径（绝对路径/~/..遍历等）</summary>
+    private bool ContainsExternalPath(string command)
+    {
+        if (string.IsNullOrWhiteSpace(command) || string.IsNullOrEmpty(_projectPath))
+            return false;
+
+        var projectRoot = Path.GetFullPath(_projectPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+        // 匹配 Windows 绝对路径: C:\... 或 D:\...
+        var winAbsPath = Regex.Matches(command, @"""?([A-Za-z]:\[^""'\s]*)""?");
+        foreach (Match m in winAbsPath)
+        {
+            try
+            {
+                var p = Path.GetFullPath(m.Groups[1].Value).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                if (!p.StartsWith(projectRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                    && !p.Equals(projectRoot, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            catch { }
+        }
+
+        // 匹配 Unix 风格绝对路径和 ~ 展开: /home/...  ~/...
+        var unixAbsPath = Regex.Matches(command, @"""?(~?/[^""'\s]*)""?");
+        foreach (Match m in unixAbsPath)
+        {
+            try
+            {
+                var raw = m.Groups[1].Value;
+                if (raw.StartsWith("~/"))
+                    raw = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) + raw[1..];
+                var p = Path.GetFullPath(raw).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                if (!p.StartsWith(projectRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                    && !p.Equals(projectRoot, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            catch { }
+        }
+
+        // 匹配可能穿越项目边界的 .. 路径
+        // e.g. cd ../../.., cat ../secret.txt
+        var traversal = Regex.Match(command, @"(^|\s)(\.\.(?:[/\\]\.\.)+[/\\]\S*)");
+        if (traversal.Success)
+        {
+            try
+            {
+                var p = Path.GetFullPath(Path.Combine(_projectPath, traversal.Groups[2].Value));
+                if (!p.StartsWith(projectRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                    && !p.Equals(projectRoot, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            catch { }
+        }
+
+        return false;
+    }
+
+    /// <summary>检测终端命令是否为潜在危险命令（删除文件/磁盘操作/权限变更/系统修改等）</summary>
+    private static bool IsDangerousCommand(string command)
+    {
+        if (string.IsNullOrWhiteSpace(command)) return false;
+
+        // 危险命令模式（基于 Qoder 的分层安全模型）
+        var dangerousPatterns = new[]
+        {
+            // 文件删除
+            @"\brm\s+-rf\b", @"\brm\s+-r\s", @"\brmdir\s+/s\b", @"\bdel\s+/[fq]\b",
+            @"Remove-Item\s+-Recurse", @"Remove-Item\s.*-Force",
+            // 磁盘操作
+            @"\bformat\b", @"\bdiskpart\b", @"\bfdisk\b", @"\bdd\s+if=",
+            // 权限变更
+            @"\bchmod\s+777\b", @"\bchown\s+-R\b", @"\bicacls\s.*/grant", @"\bcacls\s.*/g",
+            @"\bsudo\b",
+            // 系统修改
+            @"\bshutdown\b", @"\breboot\b", @"\binit\s+[06]\b",
+            @"\breg\s+(add|delete)\b", @"\bregedit\b",
+            @"\bsystemctl\s+(stop|disable|mask)\b",
+            @"\bsc\s+(stop|delete)\b",
+            // 网络配置
+            @"\bnetsh\s.*reset\b", @"\biptables\s+-[AD]\b", @"\bufw\s+(deny|reject)\b",
+            // 强制删除 / 递归删除
+            @"\brmdir\s+/s\s+/q\b", @"\bdel\s+/s\s+/q\b", @"\brm\s.*-rf\b",
+            // PowerShell 危险操作
+            @"Stop-Process\s+-Force", @"Clear-RecycleBin",
+            @"Set-ExecutionPolicy",
+        };
+
+        foreach (var pattern in dangerousPatterns)
+        {
+            if (Regex.IsMatch(command, pattern, RegexOptions.IgnoreCase))
+                return true;
+        }
+        return false;
+    }
+}
